@@ -12,6 +12,7 @@ from plotly.subplots import make_subplots
 import os
 from io import BytesIO
 from datetime import datetime
+import json
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -179,11 +180,50 @@ PLOTLY_TEMPLATE = dict(
 )
 
 
-# ── Google Drive File Registry ───────────────────────────────────────────────
-# Each file ID is permanent — even when the file contents are refreshed daily,
-# the ID stays the same. To add a new fiscal year, just upload the file to the
-# same Google Drive folder and add its ID here.
+# ── Fund Classification ─────────────────────────────────────────────────────
+# Used for Section 5: classifying funds as reimbursable vs non-reimbursable
+# when expenditures exceed revenue.
+#
+# Non-Reimbursable: local/operational funds where spending > revenue is a real
+# cash concern. Reimbursable: federal/state flow-through grants where spending
+# typically precedes reimbursement.
+#
+# Classification is by leading digits of the fund code. Order matters —
+# first match wins.
 
+FUND_CLASSIFICATION = {
+    # Non-Reimbursable (real cash concerns)
+    "11": "Non-Reimbursable",   # Operational
+    "13": "Non-Reimbursable",   # Transportation
+    "14": "Non-Reimbursable",   # Instructional Materials
+    "21": "Non-Reimbursable",   # Food Services (local revenue-backed)
+    "23": "Non-Reimbursable",   # Non-Instructional Support
+    "31": "Non-Reimbursable",   # Debt Service (Bond)
+    "32": "Non-Reimbursable",   # Debt Service (other)
+    "41": "Non-Reimbursable",   # Capital Improvements HB-33
+    "42": "Non-Reimbursable",   # Capital Improvements SB-9
+    "43": "Non-Reimbursable",   # Capital (other local)
+
+    # Reimbursable (expected: spend first, reimbursed later)
+    "24": "Reimbursable",       # Federal Flow-Through (IDEA-B, Title I, etc.)
+    "25": "Reimbursable",       # State Flow-Through
+    "26": "Reimbursable",       # Federal Direct Grants
+    "27": "Reimbursable",       # State Direct Appropriations
+    "28": "Reimbursable",       # Federal Stimulus (ESSER, etc.)
+    "29": "Reimbursable",       # State/Other Grants
+}
+
+
+def classify_fund(fund_str):
+    """Classify a fund string like '11000 - Operational' as Reimbursable or Non-Reimbursable."""
+    code = extract_code(str(fund_str))
+    for prefix, classification in FUND_CLASSIFICATION.items():
+        if code.startswith(prefix):
+            return classification
+    return "Other"
+
+
+# ── Google Drive File Registry ───────────────────────────────────────────────
 GDRIVE_FILES = {
     # Actuals
     "actuals_0607": "1gNXoqsb7KlULD0o35olSqKYxkzBpIvmY",
@@ -402,12 +442,8 @@ def compute_budget_vs_actuals(act_filtered, bud_filtered, group_col):
 
 
 # ── District Report Helpers ──────────────────────────────────────────────────
-# These build the line-item-level report matching quarterly review CSV format.
-
-# The six dimension columns that define a unique budget line
 REPORT_DIMS = ["Budget Entity", "Fund", "Function", "Object", "Program", "Job Class"]
 
-# Column names for the final CSV output (matching quarterly review format)
 REPORT_CSV_COLS = [
     "Entity", "Fund", "Function", "Object", "Program", "JobClass",
     "Actuals Period Amount", "Actuals YTD", "Encumbrance", "Actuals FTE",
@@ -416,8 +452,6 @@ REPORT_CSV_COLS = [
 
 
 def _fmt_acct_currency(val):
-    """Format currency in accounting style: $1,234.56 or ($1,234.56) for negatives.
-    Returns empty string for NaN/zero-budget-only rows where actuals are absent."""
     if pd.isna(val):
         return ""
     if val < 0:
@@ -426,38 +460,13 @@ def _fmt_acct_currency(val):
 
 
 def _fmt_acct_pct(val):
-    """Format percentage as '29.36%'. Returns empty string for NaN."""
     if pd.isna(val):
         return ""
     return f"{val:.2f}%"
 
 
 def build_district_report(act_df, bud_df, entity_name, account_type):
-    """
-    Build a line-item report for a single entity matching the quarterly
-    review CSV format.
-
-    Joins budget and actuals at the full dimensional grain
-    (Entity/Fund/Function/Object/Program/JobClass), computes derived
-    measures, and returns a formatted DataFrame ready for CSV export.
-
-    Parameters
-    ----------
-    act_df : pd.DataFrame
-        Actuals fact table, already filtered to the desired reporting period.
-    bud_df : pd.DataFrame
-        Budget fact table.
-    entity_name : str
-        The Budget Entity value to filter to.
-    account_type : str
-        "E" for expenditure, "R" for revenue.
-
-    Returns
-    -------
-    pd.DataFrame
-        Formatted report with string-formatted dollar amounts and percentages.
-    """
-    # ── Filter to entity and account type ────────────────────────────────
+    """Build a line-item report for a single entity matching quarterly review CSV format."""
     act = act_df[
         (act_df["Budget Entity"] == entity_name) &
         (act_df["Account Type"] == account_type)
@@ -471,7 +480,6 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
     if len(act) == 0 and len(bud) == 0:
         return pd.DataFrame(columns=REPORT_CSV_COLS)
 
-    # ── Aggregate actuals to line-item grain ─────────────────────────────
     if len(act) > 0:
         a_agg = act.groupby(REPORT_DIMS, dropna=False).agg(
             period_amt=("Actuals Period Amount", "sum"),
@@ -482,7 +490,6 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
     else:
         a_agg = pd.DataFrame(columns=REPORT_DIMS + ["period_amt", "ytd_amt", "enc_amt", "act_fte"])
 
-    # ── Aggregate budget to line-item grain ──────────────────────────────
     if len(bud) > 0:
         b_agg = bud.groupby(REPORT_DIMS, dropna=False).agg(
             adj_budget=("Adjusted Amt", "sum"),
@@ -491,20 +498,14 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
     else:
         b_agg = pd.DataFrame(columns=REPORT_DIMS + ["adj_budget", "adj_fte"])
 
-    # ── Full outer join on all six dimensions ────────────────────────────
     merged = b_agg.merge(a_agg, on=REPORT_DIMS, how="outer")
 
-    # ── Compute derived measures ─────────────────────────────────────────
-    # Available Balance = Adjusted Budget - YTD - Encumbrance
-    # For budget-only rows (no actuals), YTD and Enc are NaN → balance = budget
     merged["avail_balance"] = (
         merged["adj_budget"].fillna(0)
         - merged["ytd_amt"].fillna(0)
         - merged["enc_amt"].fillna(0)
     )
 
-    # Burn % = (YTD + Enc) / Adjusted Budget * 100
-    # Only compute where we have both actuals and a nonzero budget
     has_actuals = merged["ytd_amt"].notna() | merged["enc_amt"].notna()
     has_budget = merged["adj_budget"].notna() & (merged["adj_budget"] != 0)
     merged["burn_pct"] = pd.NA
@@ -515,14 +516,8 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
         * 100
     )
 
-    # ── Sort by Fund, Function, Object, Program, JobClass ────────────────
     merged = merged.sort_values(REPORT_DIMS).reset_index(drop=True)
 
-    # ── Format for CSV output ────────────────────────────────────────────
-    # Budget-only rows: actuals columns should be blank (empty string)
-    # Actuals-only rows (no budget): budget columns blank — though rare
-
-    # Determine which rows have actuals vs budget-only
     actuals_present = merged["ytd_amt"].notna() | merged["enc_amt"].notna()
     budget_present = merged["adj_budget"].notna()
 
@@ -534,7 +529,6 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
     report["Program"] = merged["Program"]
     report["JobClass"] = merged["Job Class"]
 
-    # Actuals columns: format where present, blank where budget-only
     report["Actuals Period Amount"] = merged["period_amt"].apply(
         lambda v: _fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else _fmt_acct_currency(v))
     )
@@ -548,7 +542,6 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
         lambda v: "" if pd.isna(v) else f"{v:.2f}" if v != 0 else "0.00"
     )
 
-    # Budget columns: format where present, blank where actuals-only
     report["Adjusted Budget"] = merged["adj_budget"].apply(
         lambda v: _fmt_acct_currency(v) if pd.notna(v) else ""
     )
@@ -556,24 +549,579 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
         lambda v: "" if pd.isna(v) else f"{v:.2f}" if v != 0 else "0.00"
     )
 
-    # Available Balance: always computed (formatted accounting style)
     report["Available Balance"] = merged["avail_balance"].apply(_fmt_acct_currency)
-
-    # Burn %
     report["Burn % (Actuals + Enc)"] = merged["burn_pct"].apply(_fmt_acct_pct)
 
-    # ── Handle formatting edge cases ─────────────────────────────────────
-    # Rows where actuals are truly absent (budget-only): blank out actuals cols
     budget_only_mask = ~actuals_present
     for col in ["Actuals Period Amount", "Actuals YTD", "Encumbrance", "Actuals FTE"]:
         report.loc[budget_only_mask, col] = ""
 
-    # Rows where budget is truly absent (actuals-only): blank out budget cols
     actuals_only_mask = ~budget_present
     for col in ["Adjusted Budget", "Adjusted FTE"]:
         report.loc[actuals_only_mask, col] = ""
 
     return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entity Analysis Functions (Sections 4–7)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_entity_rev_vs_exp(act_df, bud_df, entity_name):
+    """
+    Section 4: Revenue vs Expenditure by Fund.
+    Returns a DataFrame with fund-level revenue and expenditure YTD totals.
+    """
+    # Revenue actuals for entity
+    rev_act = act_df[
+        (act_df["Budget Entity"] == entity_name) &
+        (act_df["Account Type"] == "R")
+    ].groupby("Fund").agg(Revenue_YTD=("Actuals YTDAmount", "sum")).reset_index()
+
+    # Expenditure actuals for entity
+    exp_act = act_df[
+        (act_df["Budget Entity"] == entity_name) &
+        (act_df["Account Type"] == "E")
+    ].groupby("Fund").agg(Expenditure_YTD=("Actuals YTDAmount", "sum")).reset_index()
+
+    merged = rev_act.merge(exp_act, on="Fund", how="outer").fillna(0)
+    merged["Net"] = merged["Revenue_YTD"] - merged["Expenditure_YTD"]
+    merged["Total_Activity"] = merged["Revenue_YTD"].abs() + merged["Expenditure_YTD"].abs()
+    merged["Fund_Name"] = merged["Fund"].apply(extract_name)
+    merged["Fund_Code"] = merged["Fund"].apply(extract_code)
+    merged["Fund_Class"] = merged["Fund"].apply(classify_fund)
+
+    return merged.sort_values("Total_Activity", ascending=False)
+
+
+def compute_funds_exp_exceed_rev(rev_exp_df):
+    """
+    Section 5: Funds where expenditures exceed revenue.
+    Split into Non-Reimbursable (real concern) and Reimbursable (expected).
+    """
+    deficit = rev_exp_df[rev_exp_df["Net"] < 0].copy()
+    deficit["Deficit"] = deficit["Net"].abs()
+
+    non_reimb = deficit[deficit["Fund_Class"] == "Non-Reimbursable"].sort_values("Deficit", ascending=False)
+    reimb = deficit[deficit["Fund_Class"] == "Reimbursable"].sort_values("Deficit", ascending=False)
+    other = deficit[deficit["Fund_Class"] == "Other"].sort_values("Deficit", ascending=False)
+
+    return non_reimb, reimb, other
+
+
+def compute_exp_by_fund_type(act_df, entity_name):
+    """
+    Section 6: Expenditure distribution by fund.
+    Returns fund-level YTD expenditure totals for donut chart + table.
+    """
+    exp = act_df[
+        (act_df["Budget Entity"] == entity_name) &
+        (act_df["Account Type"] == "E")
+    ].groupby("Fund").agg(
+        YTD_Actuals=("Actuals YTDAmount", "sum")
+    ).reset_index()
+
+    exp["Fund_Name"] = exp["Fund"].apply(extract_name)
+    exp["Fund_Code"] = exp["Fund"].apply(extract_code)
+    exp["Fund_Class"] = exp["Fund"].apply(classify_fund)
+    total = exp["YTD_Actuals"].sum()
+    exp["Pct_of_Total"] = (exp["YTD_Actuals"] / total * 100) if total > 0 else 0
+
+    return exp.sort_values("YTD_Actuals", ascending=False)
+
+
+def compute_exp_by_function(act_df, bud_df, entity_name):
+    """
+    Section 7: Expenditure by function with budget/actuals/encumbrance.
+    Returns function-level comparison for horizontal bar + table.
+    """
+    exp_act = act_df[
+        (act_df["Budget Entity"] == entity_name) &
+        (act_df["Account Type"] == "E")
+    ].groupby("Function").agg(
+        YTD_Actuals=("Actuals YTDAmount", "sum"),
+        Encumbrance=("Actuals Encumbrance", "sum"),
+    ).reset_index()
+
+    exp_bud = bud_df[
+        (bud_df["Budget Entity"] == entity_name) &
+        (bud_df["Account Type"] == "E")
+    ].groupby("Function").agg(
+        Adjusted_Budget=("Adjusted Amt", "sum"),
+    ).reset_index()
+
+    merged = exp_bud.merge(exp_act, on="Function", how="outer").fillna(0)
+    merged["Available"] = merged["Adjusted_Budget"] - merged["YTD_Actuals"] - merged["Encumbrance"]
+    merged["Pct_Used"] = (
+        (merged["YTD_Actuals"] + merged["Encumbrance"])
+        / merged["Adjusted_Budget"].replace(0, float("nan"))
+        * 100
+    )
+    merged["Function_Name"] = merged["Function"].apply(extract_name)
+    merged["Function_Code"] = merged["Function"].apply(extract_code)
+
+    return merged.sort_values("Adjusted_Budget", ascending=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML Export Builder
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_html_report(entity_name, fy_label, period_label, rev_exp_df,
+                      non_reimb_df, reimb_df, other_df,
+                      fund_dist_df, func_df, summary_stats):
+    """
+    Generate a standalone HTML report in the cream/Playfair Display style
+    matching the quarterly review format. Includes Chart.js charts.
+    """
+    # Prepare chart data
+    # Section 4: Rev vs Exp bar chart — top 12 funds
+    top_funds_chart = rev_exp_df.head(12)
+    chart_labels = [extract_name(f) for f in top_funds_chart["Fund"]]
+    chart_rev = top_funds_chart["Revenue_YTD"].tolist()
+    chart_exp = top_funds_chart["Expenditure_YTD"].tolist()
+
+    # Section 6: Donut chart — fund distribution
+    fund_donut = fund_dist_df[fund_dist_df["YTD_Actuals"] > 0].head(10)
+    donut_labels = fund_donut["Fund_Name"].tolist()
+    donut_values = fund_donut["YTD_Actuals"].tolist()
+
+    # Section 7: Function bar chart
+    func_chart = func_df[func_df["Adjusted_Budget"] > 0].head(12)
+    func_labels = func_chart["Function_Name"].tolist()
+    func_actuals = func_chart["YTD_Actuals"].tolist()
+    func_enc = func_chart["Encumbrance"].tolist()
+    func_avail = func_chart["Available"].clip(lower=0).tolist()
+
+    # Build deficit fund tables
+    def _fund_deficit_rows(df):
+        rows = ""
+        for _, r in df.iterrows():
+            status_color = "#b91c1c" if r["Deficit"] > 100_000 else "#d97706" if r["Deficit"] > 10_000 else "#65a30d"
+            rows += f"""<tr>
+                <td>{r['Fund']}</td>
+                <td style="text-align:right">${r['Revenue_YTD']:,.0f}</td>
+                <td style="text-align:right">${r['Expenditure_YTD']:,.0f}</td>
+                <td style="text-align:right;color:{status_color};font-weight:600">({_fmt_acct_currency(r['Deficit'])})</td>
+                <td><span style="background:{status_color};color:white;padding:2px 10px;border-radius:12px;font-size:0.8rem;">
+                    {'High' if r['Deficit'] > 100_000 else 'Monitor' if r['Deficit'] > 10_000 else 'Low'}</span></td>
+            </tr>"""
+        return rows
+
+    # Build function table
+    func_table_rows = ""
+    for _, r in func_df.iterrows():
+        if r["Adjusted_Budget"] == 0 and r["YTD_Actuals"] == 0:
+            continue
+        pct_str = f"{r['Pct_Used']:.1f}%" if pd.notna(r["Pct_Used"]) else "N/A"
+        pct_color = "#b91c1c" if pd.notna(r["Pct_Used"]) and r["Pct_Used"] > 90 else "#d97706" if pd.notna(r["Pct_Used"]) and r["Pct_Used"] > 70 else "#1e3a5f"
+        func_table_rows += f"""<tr>
+            <td>{r['Function']}</td>
+            <td style="text-align:right">${r['Adjusted_Budget']:,.0f}</td>
+            <td style="text-align:right">${r['YTD_Actuals']:,.0f}</td>
+            <td style="text-align:right">${r['Encumbrance']:,.0f}</td>
+            <td style="text-align:right">${r['Available']:,.0f}</td>
+            <td style="text-align:right;color:{pct_color};font-weight:600">{pct_str}</td>
+        </tr>"""
+
+    # Fund distribution table
+    fund_table_rows = ""
+    for _, r in fund_dist_df.head(10).iterrows():
+        fund_table_rows += f"""<tr>
+            <td>{r['Fund']}</td>
+            <td style="text-align:right">${r['YTD_Actuals']:,.0f}</td>
+            <td style="text-align:right">{r['Pct_of_Total']:.1f}%</td>
+        </tr>"""
+
+    review_date = datetime.now().strftime("%B %d, %Y")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{entity_name} — {fy_label} Actuals Analysis</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Source+Sans+3:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+<style>
+    :root {{
+        --navy: #1e3a5f;
+        --gold: #c9a96e;
+        --red: #b91c1c;
+        --amber: #d97706;
+        --green: #65a30d;
+        --cream: #faf9f7;
+        --card-bg: #ffffff;
+        --text: #2d3748;
+        --text-light: #718096;
+        --border: #e8e4df;
+    }}
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{
+        font-family: 'Source Sans 3', sans-serif;
+        background: var(--cream);
+        color: var(--text);
+        line-height: 1.6;
+        padding: 40px;
+    }}
+    .header {{
+        text-align: center;
+        margin-bottom: 40px;
+        padding-bottom: 24px;
+        border-bottom: 3px solid var(--navy);
+    }}
+    .header h1 {{
+        font-family: 'Playfair Display', serif;
+        font-size: 2rem;
+        color: var(--navy);
+        margin-bottom: 4px;
+    }}
+    .header h2 {{
+        font-family: 'Playfair Display', serif;
+        font-size: 1.2rem;
+        color: var(--gold);
+        font-weight: 400;
+        margin-bottom: 8px;
+    }}
+    .header .meta {{
+        font-size: 0.9rem;
+        color: var(--text-light);
+    }}
+    .section {{
+        margin-bottom: 36px;
+    }}
+    .section h3 {{
+        font-family: 'Playfair Display', serif;
+        font-size: 1.3rem;
+        color: var(--navy);
+        margin-bottom: 16px;
+        padding-bottom: 6px;
+        border-bottom: 2px solid var(--gold);
+        display: inline-block;
+    }}
+    .cards {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 16px;
+        margin-bottom: 24px;
+    }}
+    .card {{
+        background: var(--card-bg);
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        border-left: 4px solid var(--navy);
+    }}
+    .card .label {{
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--text-light);
+        margin-bottom: 4px;
+    }}
+    .card .value {{
+        font-size: 1.6rem;
+        font-weight: 700;
+        color: var(--navy);
+    }}
+    .card.accent-gold {{ border-left-color: var(--gold); }}
+    .card.accent-red {{ border-left-color: var(--red); }}
+    .card.accent-green {{ border-left-color: var(--green); }}
+    table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+        background: var(--card-bg);
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }}
+    th {{
+        background: var(--navy);
+        color: white;
+        padding: 10px 14px;
+        text-align: left;
+        font-weight: 600;
+        font-size: 0.82rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }}
+    td {{
+        padding: 8px 14px;
+        border-bottom: 1px solid var(--border);
+    }}
+    tr:last-child td {{ border-bottom: none; }}
+    tr:hover {{ background: #f7f5f2; }}
+    .chart-container {{
+        background: var(--card-bg);
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        margin-bottom: 20px;
+    }}
+    .two-col {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 24px;
+    }}
+    @media (max-width: 768px) {{
+        .two-col {{ grid-template-columns: 1fr; }}
+        body {{ padding: 16px; }}
+    }}
+    .footer {{
+        margin-top: 40px;
+        padding-top: 20px;
+        border-top: 2px solid var(--border);
+        font-size: 0.82rem;
+        color: var(--text-light);
+        text-align: center;
+    }}
+    .sub-header {{
+        font-family: 'Playfair Display', serif;
+        font-size: 1.05rem;
+        color: var(--navy);
+        margin: 16px 0 10px 0;
+        font-weight: 600;
+    }}
+    .no-data {{
+        color: var(--text-light);
+        font-style: italic;
+        padding: 12px;
+    }}
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>{entity_name}</h1>
+    <h2>{fy_label} Actuals Analysis Dashboard</h2>
+    <div class="meta">Review Date: {review_date} · NM Public Education Department / School Budget Bureau</div>
+</div>
+
+<!-- Section 1: Executive Summary -->
+<div class="section">
+    <h3>Executive Summary</h3>
+    <div class="cards">
+        <div class="card">
+            <div class="label">Revenue YTD</div>
+            <div class="value">{fmt_currency(summary_stats['rev_ytd'], compact=True)}</div>
+        </div>
+        <div class="card accent-gold">
+            <div class="label">Expenditure YTD</div>
+            <div class="value">{fmt_currency(summary_stats['exp_ytd'], compact=True)}</div>
+        </div>
+        <div class="card {'accent-green' if summary_stats['net'] >= 0 else 'accent-red'}">
+            <div class="label">Net (Rev − Exp)</div>
+            <div class="value">{fmt_currency(summary_stats['net'], compact=True)}</div>
+        </div>
+        <div class="card">
+            <div class="label">Exp. Adjusted Budget</div>
+            <div class="value">{fmt_currency(summary_stats['exp_budget'], compact=True)}</div>
+        </div>
+    </div>
+</div>
+
+<!-- Section 4: Revenue vs Expenditure by Fund -->
+<div class="section">
+    <h3>Revenue vs. Expenditure Analysis</h3>
+    <div class="chart-container">
+        <canvas id="revExpChart" height="320"></canvas>
+    </div>
+</div>
+
+<!-- Section 5: Funds Where Expenditures Exceed Revenue -->
+<div class="section">
+    <h3>Funds Where Expenditures Exceed Revenue</h3>
+
+    <div class="sub-header">Non-Reimbursable Funds</div>
+    {'<p class="no-data">No non-reimbursable funds with expenditures exceeding revenue.</p>' if len(non_reimb_df) == 0 else f"""
+    <table>
+        <thead><tr><th>Fund</th><th style="text-align:right">Revenue YTD</th><th style="text-align:right">Expenditure YTD</th><th style="text-align:right">Net</th><th>Status</th></tr></thead>
+        <tbody>{_fund_deficit_rows(non_reimb_df)}</tbody>
+    </table>"""}
+
+    <div class="sub-header" style="margin-top:24px">Reimbursable Funds (Expected Behavior)</div>
+    {'<p class="no-data">No reimbursable funds with expenditures exceeding revenue.</p>' if len(reimb_df) == 0 else f"""
+    <table>
+        <thead><tr><th>Fund</th><th style="text-align:right">Revenue YTD</th><th style="text-align:right">Expenditure YTD</th><th style="text-align:right">Net</th><th>Status</th></tr></thead>
+        <tbody>{_fund_deficit_rows(reimb_df)}</tbody>
+    </table>"""}
+
+    {"" if len(other_df) == 0 else f'''
+    <div class="sub-header" style="margin-top:24px">Other / Unclassified Funds</div>
+    <table>
+        <thead><tr><th>Fund</th><th style="text-align:right">Revenue YTD</th><th style="text-align:right">Expenditure YTD</th><th style="text-align:right">Net</th><th>Status</th></tr></thead>
+        <tbody>{_fund_deficit_rows(other_df)}</tbody>
+    </table>'''}
+</div>
+
+<!-- Section 6: Expenditure Distribution by Fund -->
+<div class="section">
+    <h3>Expenditure Distribution by Fund</h3>
+    <div class="two-col">
+        <div class="chart-container">
+            <canvas id="fundDonut" height="300"></canvas>
+        </div>
+        <div>
+            <table>
+                <thead><tr><th>Fund</th><th style="text-align:right">YTD Spend</th><th style="text-align:right">% of Total</th></tr></thead>
+                <tbody>{fund_table_rows}</tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Section 7: Expenditure by Function -->
+<div class="section">
+    <h3>Expenditure by Function</h3>
+    <div class="chart-container">
+        <canvas id="funcChart" height="350"></canvas>
+    </div>
+    <table style="margin-top:16px">
+        <thead><tr>
+            <th>Function</th><th style="text-align:right">Budget</th>
+            <th style="text-align:right">YTD Actuals</th><th style="text-align:right">Encumbered</th>
+            <th style="text-align:right">Available</th><th style="text-align:right">% Used (Act+Enc)</th>
+        </tr></thead>
+        <tbody>{func_table_rows}</tbody>
+    </table>
+</div>
+
+<div class="footer">
+    <p>NM Public Education Department · School Budget Bureau</p>
+    <p style="margin-top:4px;font-size:0.78rem;">
+        This review is conducted pursuant to NMAC 6.20.2 and does not constitute an audit.
+    </p>
+</div>
+
+<script>
+// Color palette
+const navy = '#1e3a5f';
+const gold = '#c9a96e';
+const red  = '#b91c1c';
+const teal = '#2dd4bf';
+const amber = '#d97706';
+const green = '#65a30d';
+const violet = '#6366f1';
+
+const palette = [navy, gold, '#4f8df5', teal, amber, red, green, violet, '#ec4899', '#06b6d4'];
+
+// Section 4: Revenue vs Expenditure
+new Chart(document.getElementById('revExpChart'), {{
+    type: 'bar',
+    data: {{
+        labels: {json.dumps(chart_labels)},
+        datasets: [
+            {{
+                label: 'Revenue YTD',
+                data: {json.dumps(chart_rev)},
+                backgroundColor: navy,
+                borderRadius: 4,
+            }},
+            {{
+                label: 'Expenditure YTD',
+                data: {json.dumps(chart_exp)},
+                backgroundColor: gold,
+                borderRadius: 4,
+            }}
+        ]
+    }},
+    options: {{
+        responsive: true,
+        plugins: {{
+            legend: {{ position: 'top' }},
+            tooltip: {{
+                callbacks: {{
+                    label: ctx => ctx.dataset.label + ': $' + ctx.raw.toLocaleString()
+                }}
+            }}
+        }},
+        scales: {{
+            x: {{ ticks: {{ maxRotation: 40, font: {{ size: 11 }} }} }},
+            y: {{ ticks: {{ callback: v => '$' + (v/1000000).toFixed(1) + 'M' }} }}
+        }}
+    }}
+}});
+
+// Section 6: Fund Donut
+new Chart(document.getElementById('fundDonut'), {{
+    type: 'doughnut',
+    data: {{
+        labels: {json.dumps(donut_labels)},
+        datasets: [{{
+            data: {json.dumps(donut_values)},
+            backgroundColor: palette.slice(0, {len(donut_labels)}),
+            borderWidth: 2,
+            borderColor: '#faf9f7'
+        }}]
+    }},
+    options: {{
+        responsive: true,
+        plugins: {{
+            legend: {{ position: 'right', labels: {{ font: {{ size: 11 }} }} }},
+            tooltip: {{
+                callbacks: {{
+                    label: ctx => ctx.label + ': $' + ctx.raw.toLocaleString()
+                }}
+            }}
+        }}
+    }}
+}});
+
+// Section 7: Function Stacked Bar
+new Chart(document.getElementById('funcChart'), {{
+    type: 'bar',
+    data: {{
+        labels: {json.dumps(func_labels)},
+        datasets: [
+            {{
+                label: 'YTD Actuals',
+                data: {json.dumps(func_actuals)},
+                backgroundColor: navy,
+                borderRadius: 2,
+            }},
+            {{
+                label: 'Encumbrance',
+                data: {json.dumps(func_enc)},
+                backgroundColor: amber,
+                borderRadius: 2,
+            }},
+            {{
+                label: 'Available',
+                data: {json.dumps(func_avail)},
+                backgroundColor: '#e8e4df',
+                borderRadius: 2,
+            }}
+        ]
+    }},
+    options: {{
+        indexAxis: 'y',
+        responsive: true,
+        plugins: {{
+            legend: {{ position: 'top' }},
+            tooltip: {{
+                callbacks: {{
+                    label: ctx => ctx.dataset.label + ': $' + ctx.raw.toLocaleString()
+                }}
+            }}
+        }},
+        scales: {{
+            x: {{
+                stacked: true,
+                ticks: {{ callback: v => '$' + (v/1000000).toFixed(1) + 'M' }}
+            }},
+            y: {{
+                stacked: true,
+                ticks: {{ font: {{ size: 11 }} }}
+            }}
+        }}
+    }}
+}});
+</script>
+</body>
+</html>"""
+
+    return html
 
 
 # ── Sidebar Filters ──────────────────────────────────────────────────────────
@@ -1118,14 +1666,14 @@ with tab_trends:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 5: District Report  ★ NEW ★
+# TAB 5: District Report + Entity Analysis (Sections 4–7)
 # ════════════════════════════════════════════════════════════════════════════
 with tab_report:
 
     st.markdown('<div class="section-header">Quarterly District Report</div>', unsafe_allow_html=True)
     st.caption(
         "Generate expenditure and revenue reports in the standard quarterly review "
-        "CSV format. Select a district, then download each report separately."
+        "CSV format, plus an interactive financial analysis with HTML export."
     )
 
     # ── Entity selector (independent of sidebar entity filter) ───────────
@@ -1140,36 +1688,27 @@ with tab_report:
         key="report_entity_select"
     )
 
-    # ── Period for actuals (use sidebar period) ──────────────────────────
-    # The actuals data is already filtered to selected_period via act_f,
-    # but for the report we want to use act_raw filtered only to the period
-    # (not the sidebar dimension filters — we want the full entity picture).
+    # ── Period for actuals ───────────────────────────────────────────────
     act_for_report = act_raw
     if selected_period:
         act_for_report = act_for_report[act_for_report["Reporting Period"] == selected_period]
 
-    bud_for_report = bud_raw  # budget is not period-filtered
+    bud_for_report = bud_raw
 
     # ── Build reports ────────────────────────────────────────────────────
     if report_entity:
-        # Build short entity name for filenames
         entity_short = report_entity.replace(" ", "_").replace("/", "-")
         fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
         period_code = selected_period.lower() if selected_period else "all"
 
-        # Expenditure report
+        # CSV reports (existing)
         exp_report = build_district_report(act_for_report, bud_for_report, report_entity, "E")
-        # Revenue report
         rev_report = build_district_report(act_for_report, bud_for_report, report_entity, "R")
 
         # ── Summary metrics ──────────────────────────────────────────────
         st.markdown(f"**{report_entity}** · FY {fy_label} · {period_label}")
 
-        rm1, rm2, rm3, rm4 = st.columns(4)
-        rm1.metric("Expenditure Lines", f"{len(exp_report):,}")
-        rm2.metric("Revenue Lines", f"{len(rev_report):,}")
-
-        # Quick totals from unformatted data for display
+        # Compute totals for summary cards
         exp_act_entity = act_for_report[
             (act_for_report["Budget Entity"] == report_entity) &
             (act_for_report["Account Type"] == "E")
@@ -1178,66 +1717,328 @@ with tab_report:
             (bud_for_report["Budget Entity"] == report_entity) &
             (bud_for_report["Account Type"] == "E")
         ]
+        rev_act_entity = act_for_report[
+            (act_for_report["Budget Entity"] == report_entity) &
+            (act_for_report["Account Type"] == "R")
+        ]
+
         exp_budget_total = exp_bud_entity["Adjusted Amt"].sum()
         exp_ytd_total = exp_act_entity["Actuals YTDAmount"].sum()
-        rm3.metric("Exp. Adjusted Budget", fmt_currency(exp_budget_total, compact=True))
-        rm4.metric("Exp. YTD Actuals", fmt_currency(exp_ytd_total, compact=True))
+        rev_ytd_total = rev_act_entity["Actuals YTDAmount"].sum()
+        net_total = rev_ytd_total - exp_ytd_total
 
-        # ── Expenditure section ──────────────────────────────────────────
+        rm1, rm2, rm3, rm4 = st.columns(4)
+        rm1.metric("Revenue YTD", fmt_currency(rev_ytd_total, compact=True))
+        rm2.metric("Expenditure YTD", fmt_currency(exp_ytd_total, compact=True))
+        rm3.metric("Net (Rev − Exp)", fmt_currency(net_total, compact=True))
+        rm4.metric("Exp. Adjusted Budget", fmt_currency(exp_budget_total, compact=True))
+
+        # ──────────────────────────────────────────────────────────────────
+        # CSV Data Export Section (existing functionality, preserved)
+        # ──────────────────────────────────────────────────────────────────
+        with st.expander("📥 CSV / Excel Data Exports", expanded=False):
+            st.markdown("**Expenditure Report**")
+            if len(exp_report) > 0:
+                st.dataframe(exp_report, use_container_width=True, height=300)
+                exp_filename = f"{entity_short}_fy{fy_code}_{period_code}_exp.csv"
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    st.download_button(
+                        "📥 Expenditure CSV",
+                        data=exp_report.to_csv(index=False),
+                        file_name=exp_filename,
+                        mime="text/csv",
+                        key="dl_exp_csv"
+                    )
+                with ec2:
+                    st.download_button(
+                        "📥 Expenditure Excel",
+                        data=to_excel_download(exp_report, "Expenditures"),
+                        file_name=exp_filename.replace(".csv", ".xlsx"),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_exp_xlsx"
+                    )
+            else:
+                st.info("No expenditure data for this entity.")
+
+            st.markdown("---")
+            st.markdown("**Revenue Report**")
+            if len(rev_report) > 0:
+                st.dataframe(rev_report, use_container_width=True, height=300)
+                rev_filename = f"{entity_short}_fy{fy_code}_{period_code}_rev.csv"
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    st.download_button(
+                        "📥 Revenue CSV",
+                        data=rev_report.to_csv(index=False),
+                        file_name=rev_filename,
+                        mime="text/csv",
+                        key="dl_rev_csv"
+                    )
+                with rc2:
+                    st.download_button(
+                        "📥 Revenue Excel",
+                        data=to_excel_download(rev_report, "Revenue"),
+                        file_name=rev_filename.replace(".csv", ".xlsx"),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_rev_xlsx"
+                    )
+            else:
+                st.info("No revenue data for this entity.")
+
+        # ──────────────────────────────────────────────────────────────────
+        # NEW: Entity Financial Analysis (Sections 4–7)
+        # ──────────────────────────────────────────────────────────────────
         st.markdown("---")
-        st.markdown('<div class="section-header">Expenditure Report</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Financial Analysis</div>', unsafe_allow_html=True)
+        st.caption("Interactive analysis for the selected entity. Use the HTML export button below to generate a standalone report.")
 
-        if len(exp_report) > 0:
-            st.dataframe(exp_report, use_container_width=True, height=400)
+        # ── Section 4: Revenue vs Expenditure by Fund ────────────────────
+        st.markdown("#### Revenue vs. Expenditure by Fund")
 
-            exp_filename = f"{entity_short}_fy{fy_code}_{period_code}_exp.csv"
-            ec1, ec2 = st.columns(2)
-            with ec1:
-                st.download_button(
-                    f"📥 Download Expenditure CSV",
-                    data=exp_report.to_csv(index=False),
-                    file_name=exp_filename,
-                    mime="text/csv",
-                    key="dl_exp_csv"
-                )
-            with ec2:
-                st.download_button(
-                    f"📥 Download Expenditure Excel",
-                    data=to_excel_download(exp_report, "Expenditures"),
-                    file_name=exp_filename.replace(".csv", ".xlsx"),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_exp_xlsx"
+        rev_exp_df = compute_entity_rev_vs_exp(act_for_report, bud_for_report, report_entity)
+
+        if len(rev_exp_df) > 0:
+            top_rev_exp = rev_exp_df.head(12)
+
+            fig_revexp = go.Figure()
+            fig_revexp.add_trace(go.Bar(
+                name="Revenue YTD",
+                x=top_rev_exp["Fund_Name"],
+                y=top_rev_exp["Revenue_YTD"],
+                marker_color="#4f8df5",
+                hovertemplate="%{x}<br>Revenue: $%{y:,.0f}<extra></extra>"
+            ))
+            fig_revexp.add_trace(go.Bar(
+                name="Expenditure YTD",
+                x=top_rev_exp["Fund_Name"],
+                y=top_rev_exp["Expenditure_YTD"],
+                marker_color="#f59e0b",
+                hovertemplate="%{x}<br>Expenditure: $%{y:,.0f}<extra></extra>"
+            ))
+            fig_revexp.update_layout(
+                **PLOTLY_TEMPLATE["layout"].to_plotly_json(),
+                barmode="group",
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis_tickangle=-30,
+                yaxis_title=""
+            )
+            st.plotly_chart(fig_revexp, use_container_width=True)
+        else:
+            st.info("No revenue or expenditure data available.")
+
+        # ── Section 5: Funds Where Exp > Rev ─────────────────────────────
+        st.markdown("#### Funds Where Expenditures Exceed Revenue")
+
+        if len(rev_exp_df) > 0:
+            non_reimb, reimb, other_funds = compute_funds_exp_exceed_rev(rev_exp_df)
+
+            s5_c1, s5_c2 = st.columns(2)
+
+            with s5_c1:
+                st.markdown("**Non-Reimbursable Funds** _(real cash concern)_")
+                if len(non_reimb) > 0:
+                    nr_display = non_reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
+                    nr_display.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
+                    st.dataframe(
+                        nr_display.style.format({
+                            "Revenue YTD": "${:,.0f}",
+                            "Expenditure YTD": "${:,.0f}",
+                            "Net": "${:,.0f}"
+                        }).map(
+                            lambda v: "color: #f43f5e" if isinstance(v, (int, float)) and v < 0 else "",
+                            subset=["Net"]
+                        ),
+                        use_container_width=True,
+                        height=min(300, max(100, len(non_reimb) * 40 + 60))
+                    )
+                else:
+                    st.success("No non-reimbursable fund deficits found.")
+
+            with s5_c2:
+                st.markdown("**Reimbursable Funds** _(expected: spend first, reimburse later)_")
+                if len(reimb) > 0:
+                    r_display = reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
+                    r_display.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
+                    st.dataframe(
+                        r_display.style.format({
+                            "Revenue YTD": "${:,.0f}",
+                            "Expenditure YTD": "${:,.0f}",
+                            "Net": "${:,.0f}"
+                        }),
+                        use_container_width=True,
+                        height=min(300, max(100, len(reimb) * 40 + 60))
+                    )
+                else:
+                    st.info("No reimbursable fund deficits.")
+
+            if len(other_funds) > 0:
+                with st.expander(f"Other / Unclassified Funds ({len(other_funds)})"):
+                    o_display = other_funds[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
+                    o_display.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
+                    st.dataframe(
+                        o_display.style.format({
+                            "Revenue YTD": "${:,.0f}",
+                            "Expenditure YTD": "${:,.0f}",
+                            "Net": "${:,.0f}"
+                        }),
+                        use_container_width=True
+                    )
+
+        # ── Section 6: Expenditure Distribution by Fund ──────────────────
+        st.markdown("#### Expenditure Distribution by Fund")
+
+        fund_dist = compute_exp_by_fund_type(act_for_report, report_entity)
+
+        if len(fund_dist) > 0 and fund_dist["YTD_Actuals"].sum() > 0:
+            s6_c1, s6_c2 = st.columns([2, 3])
+
+            with s6_c1:
+                fund_donut_data = fund_dist[fund_dist["YTD_Actuals"] > 0].head(10)
+                fig_donut = go.Figure(go.Pie(
+                    labels=fund_donut_data["Fund_Name"],
+                    values=fund_donut_data["YTD_Actuals"],
+                    hole=0.5,
+                    textinfo="label+percent",
+                    textposition="outside",
+                    marker=dict(
+                        colors=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e", "#8b5cf6",
+                                "#06b6d4", "#84cc16", "#ec4899", "#f97316", "#6366f1"]
+                    ),
+                    hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>"
+                ))
+                tmpl_donut = PLOTLY_TEMPLATE["layout"].to_plotly_json()
+                tmpl_donut["margin"] = dict(l=10, r=10, t=10, b=10)
+                fig_donut.update_layout(**tmpl_donut, height=350, showlegend=False)
+                st.plotly_chart(fig_donut, use_container_width=True)
+
+            with s6_c2:
+                fd_display = fund_dist.head(10)[["Fund", "YTD_Actuals", "Pct_of_Total"]].copy()
+                fd_display.columns = ["Fund", "YTD Spend", "% of Total"]
+                st.dataframe(
+                    fd_display.style.format({
+                        "YTD Spend": "${:,.0f}",
+                        "% of Total": "{:.1f}%"
+                    }),
+                    use_container_width=True,
+                    height=min(400, max(150, len(fd_display) * 40 + 60))
                 )
         else:
-            st.info("No expenditure data for this entity.")
+            st.info("No expenditure data available for fund distribution.")
 
-        # ── Revenue section ──────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown('<div class="section-header">Revenue Report</div>', unsafe_allow_html=True)
+        # ── Section 7: Expenditure by Function ───────────────────────────
+        st.markdown("#### Expenditure by Function")
 
-        if len(rev_report) > 0:
-            st.dataframe(rev_report, use_container_width=True, height=400)
+        func_data = compute_exp_by_function(act_for_report, bud_for_report, report_entity)
 
-            rev_filename = f"{entity_short}_fy{fy_code}_{period_code}_rev.csv"
-            rc1, rc2 = st.columns(2)
-            with rc1:
-                st.download_button(
-                    f"📥 Download Revenue CSV",
-                    data=rev_report.to_csv(index=False),
-                    file_name=rev_filename,
-                    mime="text/csv",
-                    key="dl_rev_csv"
-                )
-            with rc2:
-                st.download_button(
-                    f"📥 Download Revenue Excel",
-                    data=to_excel_download(rev_report, "Revenue"),
-                    file_name=rev_filename.replace(".csv", ".xlsx"),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_rev_xlsx"
-                )
+        if len(func_data) > 0:
+            func_chart_data = func_data[func_data["Adjusted_Budget"] > 0].head(12)
+
+            fig_func_bar = go.Figure()
+            fig_func_bar.add_trace(go.Bar(
+                name="YTD Actuals",
+                y=func_chart_data["Function_Name"],
+                x=func_chart_data["YTD_Actuals"],
+                orientation="h",
+                marker_color="#4f8df5",
+                hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_func_bar.add_trace(go.Bar(
+                name="Encumbrance",
+                y=func_chart_data["Function_Name"],
+                x=func_chart_data["Encumbrance"],
+                orientation="h",
+                marker_color="#f59e0b",
+                hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_func_bar.add_trace(go.Bar(
+                name="Available",
+                y=func_chart_data["Function_Name"],
+                x=func_chart_data["Available"].clip(lower=0),
+                orientation="h",
+                marker_color="#1e2130",
+                marker_line=dict(color="#4f8df5", width=1),
+                hovertemplate="%{y}<br>Available: $%{x:,.0f}<extra></extra>"
+            ))
+            tmpl_func = PLOTLY_TEMPLATE["layout"].to_plotly_json()
+            tmpl_func["yaxis"] = dict(autorange="reversed", gridcolor="#1e2130", zerolinecolor="#2a2d3e")
+            fig_func_bar.update_layout(
+                **tmpl_func,
+                barmode="stack",
+                height=max(300, len(func_chart_data) * 35),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis_title=""
+            )
+            st.plotly_chart(fig_func_bar, use_container_width=True)
+
+            # Function detail table
+            func_table = func_data[["Function", "Adjusted_Budget", "YTD_Actuals",
+                                     "Encumbrance", "Available", "Pct_Used"]].copy()
+            func_table.columns = ["Function", "Budget", "YTD Actuals", "Encumbered", "Available", "% Used (Act+Enc)"]
+            st.dataframe(
+                func_table.style.format({
+                    "Budget": "${:,.0f}",
+                    "YTD Actuals": "${:,.0f}",
+                    "Encumbered": "${:,.0f}",
+                    "Available": "${:,.0f}",
+                    "% Used (Act+Enc)": "{:.1f}%"
+                }),
+                use_container_width=True,
+                height=min(500, max(150, len(func_table) * 40 + 60))
+            )
         else:
-            st.info("No revenue data for this entity.")
+            st.info("No function-level expenditure data available.")
+
+        # ──────────────────────────────────────────────────────────────────
+        # HTML Export Button
+        # ──────────────────────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown('<div class="section-header">Export Analysis</div>', unsafe_allow_html=True)
+
+        summary_stats = {
+            "rev_ytd": rev_ytd_total,
+            "exp_ytd": exp_ytd_total,
+            "net": net_total,
+            "exp_budget": exp_budget_total,
+        }
+
+        # Compute data for HTML export
+        if len(rev_exp_df) > 0:
+            non_reimb_html, reimb_html, other_html = compute_funds_exp_exceed_rev(rev_exp_df)
+        else:
+            non_reimb_html = reimb_html = other_html = pd.DataFrame()
+
+        fund_dist_html = compute_exp_by_fund_type(act_for_report, report_entity) if len(act_for_report) > 0 else pd.DataFrame()
+        func_html = compute_exp_by_function(act_for_report, bud_for_report, report_entity)
+
+        html_content = build_html_report(
+            entity_name=report_entity,
+            fy_label=fy_label,
+            period_label=period_label,
+            rev_exp_df=rev_exp_df if len(rev_exp_df) > 0 else pd.DataFrame(columns=["Fund","Revenue_YTD","Expenditure_YTD","Fund_Name"]),
+            non_reimb_df=non_reimb_html,
+            reimb_df=reimb_html,
+            other_df=other_html,
+            fund_dist_df=fund_dist_html if len(fund_dist_html) > 0 else pd.DataFrame(columns=["Fund","YTD_Actuals","Fund_Name","Pct_of_Total"]),
+            func_df=func_html if len(func_html) > 0 else pd.DataFrame(columns=["Function","Adjusted_Budget","YTD_Actuals","Encumbrance","Available","Pct_Used"]),
+            summary_stats=summary_stats
+        )
+
+        html_filename = f"{entity_short}_fy{fy_code}_{period_code}_analysis.html"
+
+        st.download_button(
+            "📄 Download HTML Analysis Report",
+            data=html_content,
+            file_name=html_filename,
+            mime="text/html",
+            key="dl_html_report"
+        )
+        st.caption(
+            "This HTML report includes Sections 1, 4–7 from the quarterly review template. "
+            "Sections requiring your memo (Key Concerns, Compliance, Audit Findings, Action Items) "
+            "can be added after export or in a future update."
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
