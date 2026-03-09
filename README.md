@@ -1,30 +1,30 @@
 # OBMS Financial Explorer
 
-A Streamlit-based financial analysis platform for the New Mexico Public Education Department's School Budget Bureau. Provides interactive budget-vs-actuals reporting, entity-level drill-downs, and quarterly review analytics for 216+ school districts and charter schools — powered by OBMS data extracted from SSAS cubes via XMLA.
+A Streamlit-based financial analysis platform for the New Mexico Public Education Department's School Budget Bureau. Provides interactive budget authority tracking, actuals reporting, and salary/FTE analytics for 216+ school districts and charter schools — powered by OBMS data extracted from SSAS cubes via XMLA.
 
 ## Overview
 
 The OBMS Financial Explorer replaces manual Power BI workflows with a lightweight, shareable web app that reads parquet files directly from Google Drive. Data is extracted daily from the OBMS SSAS cubes using Python/XMLA scripts and stored as parquet files (~40 files, ~8M rows, FY2006–present). The app loads only the fiscal years you select, keeping things fast even with 20 years of history available.
 
-## Features
+## Tabs
 
-### Global Views
-- **Overview Dashboard** — KPI cards (budget, YTD actuals, encumbrance, balance, % spent/committed), budget-vs-actuals by fund, spend distribution treemap by function, and execution gauges with expected-pace benchmarks
-- **Entity Analysis** — Scatter plot of all entities by budget size vs. spend rate, with color-coded commitment levels and expected-pace reference lines; sortable detail table
-- **Drill-Down** — Dimensional analysis by fund, function, object, program, job class, or location with stacked horizontal bars and full data tables
-- **Trends** — Quarter-over-quarter YTD cumulative spend, period spend, and FTE trends with multi-year overlay
+### 1. Overview
+Executive snapshot for the selected entity (or all entities). Revenue and expenditure budgets, YTD actuals, encumbrance, and net position at a glance. Revenue vs. expenditure by fund with grouped bar chart. Funds where expenditures exceed revenue, split by non-reimbursable (cash concern) vs. reimbursable (expected behavior). Budget execution gauges — expenditure % spent, % committed, and revenue % collected vs. expected pace. Expenditure treemap by function with % spent color scale.
 
-### District Report Tab
-- **CSV/Excel Data Exports** — Line-item expenditure and revenue reports at the full dimensional grain (entity/fund/function/object/program/job class), formatted in the standard quarterly review CSV format for upload to the Actuals Analysis compliance app
-- **Revenue vs. Expenditure Analysis** (Section 4) — Grouped bar chart comparing revenue and expenditure YTD by fund for the selected entity
-- **Funds Where Expenditures Exceed Revenue** (Section 5) — Automatic classification of deficit funds as non-reimbursable (operational, capital, debt service — real cash concerns) or reimbursable (federal/state flow-through — expected behavior), with color-coded severity
-- **Expenditure Distribution by Fund** (Section 6) — Donut chart and top-10 table showing where expenditure dollars are concentrated
-- **Expenditure by Function** (Section 7) — Horizontal stacked bar (actuals + encumbrance + available) with detail table including budget, YTD, encumbered, available balance, and % used
-- **HTML Export** — One-click download of a standalone HTML analysis report styled with Playfair Display / Source Sans 3 on a cream background, matching the quarterly review report format, with Chart.js visualizations and the NMAC 6.20.2 disclaimer
+### 2. Budget Authority
+Dedicated view of the budget authority lifecycle: Beginning Budget → BAR Adjustments → Adjusted Budget, with FTE. Revenue budget vs. expenditure budget side-by-side comparison showing where approved authority is allocated. BAR adjustment analysis with waterfall chart (increases vs. decreases by fund) and detail table by fund/function. Budget authority vs. actuals comparison grouped by function, object, or fund — flags lines where expenditures + encumbrances exceed budget authority (NMAC compliance). CSV/Excel export matching the standard format: Entity, Fund, Function, Object, Program, Location, JobClass, Beginning Budget, Beginning FTE, Adjustment Amount, Adjustment FTE, Adjusted Budget, Adjusted FTE.
 
-### Data Export Tab
-- Filtered budget and actuals data export to Excel/CSV
-- Budget-vs-actuals summary export grouped by any dimension
+### 3. Actuals
+Actuals analysis with spend distribution (toggleable by fund, function, or object), budget vs. actuals by function with stacked bars, and full detail tables. CSV/Excel export of line-item expenditure and revenue reports at the full OBMS dimensional grain including Location (Fund → Function → Object → Program → Location → Job Class), formatted for the Actuals Analysis compliance app.
+
+### 4. Salary & Benefits
+Analysis of the largest expenditure category. Expenditure composition breakdown: salaries, benefits, contracted services, and other — with budget vs. YTD comparison. FTE budget vs. actual by job class with variance flags and average salary calculations. Staffing balance by function category (instruction, student support, school administration, general administration, etc.) — surfaces top-heavy admin ratios. Contracted services detail (Object 53xxx) showing where non-FTE dollars are going by function and object.
+
+## Filter Architecture
+
+**Global filters (sidebar):** Fiscal Year, Reporting Period, Budget Entity — apply to all tabs.
+
+**Per-tab filters (inline):** Fund, Function, Object, Program, Location, Job Class — each tab maintains its own dimensional filters so you can filter Budget Authority to Fund 11000 without affecting your Salary & Benefits view.
 
 ## Data Architecture
 
@@ -45,7 +45,7 @@ Each parquet file is extracted daily at 5:30 AM via Windows Task Scheduler runni
 
 **Actuals fact table:** `Budget Entity`, `Fund`, `Function`, `Object`, `Program`, `Job Class`, `Location`, `Account Type` (E/R), `Reporting Period` (Q1–Q4), `Actuals YTDAmount`, `Actuals Period Amount`, `Actuals Encumbrance`, `Actuals FTE`, `FiscalYearKey`, `PeriodOrder`
 
-**Budget fact table:** `Budget Entity`, `Fund`, `Function`, `Object`, `Program`, `Job Class`, `Location`, `Account Type` (E/R), `Adjusted Amt`, `Final Amt`, `Final FTE`, `FiscalYearKey`
+**Budget fact table:** `Budget Entity`, `Fund`, `Function`, `Object`, `Program`, `Job Class`, `Location`, `Account Type` (E/R), `Final Amt` (beginning budget), `Adjustment Amt` (BAR changes), `Adjusted Amt` (final budget), `Final FTE`, `Adjustment FTE`, `Adjusted FTE`, `FiscalYearKey`
 
 ## Fund Classification
 
@@ -64,49 +64,36 @@ The app classifies funds by leading code digits for the revenue-vs-expenditure d
 | 28 | Reimbursable | Federal Stimulus (ESSER) |
 | 29 | Reimbursable | State/Other Grants |
 
-This mapping is defined in `FUND_CLASSIFICATION` and can be adjusted as needed.
-
 ## Setup
 
 ### Requirements
 - Python 3.10+
 - Streamlit
-- pandas
-- plotly
-- openpyxl (for Excel export)
-- pyarrow (for parquet reading)
-
-### Installation
-
-```bash
-pip install streamlit pandas plotly openpyxl pyarrow
-```
+- pandas, plotly, openpyxl, pyarrow, numpy
 
 ### Running Locally
 
 ```bash
-streamlit run obms_financial_explorer.py
+pip install streamlit pandas plotly openpyxl pyarrow numpy
+streamlit run obms_explorer.py
 ```
 
 ### Deployment
 
-The app is designed for Streamlit Community Cloud deployment via GitHub. The parquet files must be publicly shared on Google Drive (view access) for the app to read them without authentication.
+Designed for Streamlit Community Cloud via GitHub. Parquet files must be publicly shared on Google Drive (view access).
 
 To add a new fiscal year:
-1. Upload the actuals and budget parquet files to the Google Drive folder
-2. Add the file IDs to the `GDRIVE_FILES` dictionary in the script
+1. Upload the actuals and budget parquet files to Google Drive
+2. Add the file IDs to `GDRIVE_FILES` in the script
 3. Push to GitHub — Streamlit Cloud picks up the change automatically
 
 ## Roadmap
 
-Planned additions to the District Report analysis:
-
-- **Section 8 — Encumbrance Risk Analysis:** Flag line items where actuals + encumbrances exceed adjusted budget (committed over-expenditures)
-- **Section 9 — Burn Rate / Pace Analysis:** Flag over-pace lines (>40% at Q1) and under-pace lines ($0 actuals on budgets >$50K), excluding cash/reserve objects
-- **Section 10 — FTE Variance Analysis:** Compare actuals FTE to budgeted FTE on Object 51100 (salaries) by job class, flagging understaffed/overstaffed positions
-- **Section 11 — Salary by Job Class:** Object 51100 breakdown with FTE delta
-- **Section 12 — Program-Level Spending:** Expenditures grouped by program code with donut chart
-- **Memo Integration:** Optional text input or file upload for reviewer notes (Key Concerns, Compliance Highlights, Audit Findings, Action Items) that get woven into the HTML export
+- **HTML Export** — Standalone quarterly review report (Playfair Display / Source Sans 3, cream background, Chart.js) with NMAC 6.20.2 disclaimer
+- **Encumbrance Risk Analysis** — Flag lines where actuals + encumbrances exceed adjusted budget
+- **Burn Rate / Pace Analysis** — Over-pace and under-pace detection by quarter
+- **Enrollment Projection Outlook** — Track growth projections vs. 40-day count; flag mid-year SEG cut risk
+- **Memo Integration** — Reviewer notes (Key Concerns, Compliance, Audit Findings, Action Items) woven into HTML export
 
 ## Author
 

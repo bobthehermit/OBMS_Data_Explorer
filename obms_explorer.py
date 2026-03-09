@@ -1,18 +1,23 @@
 """
-OBMS Financial Explorer
-A Streamlit-based Power BI alternative for NM PED School Budget Bureau
+OBMS Financial Explorer v2
+NM PED · School Budget Bureau
 Reads parquet files from Google Drive (extracted from OBMS SSAS cubes via XMLA)
+
+Tabs:
+  1. Overview        – Executive snapshot per entity
+  2. Budget Authority – Revenue & expenditure budget detail, BAR analysis, CSV export
+  3. Actuals          – Quarterly actuals with full OBMS string (incl. Location), CSV export
+  4. Salary & Benefits – FTE analysis, job class breakdown, contracted services
 """
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import os
 from io import BytesIO
 from datetime import datetime
 import json
+import numpy as np
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -41,12 +46,10 @@ st.markdown("""
     --border-subtle: #2a2d3e;
 }
 
-/* Global font */
 html, body, [class*="css"] {
     font-family: 'DM Sans', sans-serif !important;
 }
 
-/* Metric cards */
 div[data-testid="stMetric"] {
     background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-card-hover) 100%);
     border: 1px solid var(--border-subtle);
@@ -72,7 +75,6 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"] {
     font-size: 1.6rem;
 }
 
-/* Sidebar styling */
 section[data-testid="stSidebar"] {
     background: #0d0f18;
     border-right: 1px solid var(--border-subtle);
@@ -87,7 +89,6 @@ section[data-testid="stSidebar"] .stRadio label {
     color: var(--text-secondary) !important;
 }
 
-/* Tab styling */
 button[data-baseweb="tab"] {
     font-family: 'DM Sans', sans-serif !important;
     font-weight: 600;
@@ -95,13 +96,11 @@ button[data-baseweb="tab"] {
     letter-spacing: 0.02em;
 }
 
-/* Dataframe styling */
 div[data-testid="stDataFrame"] {
     border-radius: 10px;
     overflow: hidden;
 }
 
-/* Download buttons */
 .stDownloadButton > button {
     background: linear-gradient(135deg, var(--accent-blue), var(--accent-violet)) !important;
     color: white !important;
@@ -116,7 +115,6 @@ div[data-testid="stDataFrame"] {
     opacity: 0.85 !important;
 }
 
-/* Section headers */
 .section-header {
     font-family: 'DM Sans', sans-serif;
     font-weight: 700;
@@ -130,7 +128,6 @@ div[data-testid="stDataFrame"] {
     display: inline-block;
 }
 
-/* Logo / Title area */
 .app-title {
     font-family: 'DM Sans', sans-serif;
     font-weight: 700;
@@ -150,7 +147,6 @@ div[data-testid="stDataFrame"] {
     margin-top: 2px;
 }
 
-/* Expander */
 details {
     border: 1px solid var(--border-subtle) !important;
     border-radius: 10px !important;
@@ -161,61 +157,47 @@ details {
 
 
 # ── Plotly Theme ─────────────────────────────────────────────────────────────
-PLOTLY_TEMPLATE = dict(
-    layout=go.Layout(
-        font=dict(family="DM Sans, sans-serif", color="#e8eaed"),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        colorway=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e", "#8b5cf6",
-                   "#06b6d4", "#84cc16", "#ec4899", "#f97316", "#6366f1"],
-        xaxis=dict(gridcolor="#1e2130", zerolinecolor="#2a2d3e"),
-        yaxis=dict(gridcolor="#1e2130", zerolinecolor="#2a2d3e"),
-        margin=dict(l=40, r=20, t=50, b=40),
-        hoverlabel=dict(
-            bgcolor="#1a1d2e",
-            bordercolor="#4f8df5",
-            font=dict(family="DM Sans", color="#e8eaed", size=13)
-        ),
-    )
+_PLOTLY_BASE = dict(
+    font=dict(family="DM Sans, sans-serif", color="#e8eaed"),
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    colorway=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e", "#8b5cf6",
+               "#06b6d4", "#84cc16", "#ec4899", "#f97316", "#6366f1"],
+    hoverlabel=dict(
+        bgcolor="#1a1d2e",
+        bordercolor="#4f8df5",
+        font=dict(family="DM Sans", color="#e8eaed", size=13)
+    ),
 )
+
+# Kept as a spreadable dict for simple cases (no xaxis/yaxis/margin overrides)
+PLOTLY_LAYOUT = {
+    **_PLOTLY_BASE,
+    "xaxis": dict(gridcolor="#1e2130", zerolinecolor="#2a2d3e"),
+    "yaxis": dict(gridcolor="#1e2130", zerolinecolor="#2a2d3e"),
+    "margin": dict(l=40, r=20, t=50, b=40),
+}
+
+
+def plotly_layout(**overrides):
+    """Return layout dict with defaults. Overrides replace conflicting keys."""
+    base = dict(PLOTLY_LAYOUT)
+    base.update(overrides)
+    return base
 
 
 # ── Fund Classification ─────────────────────────────────────────────────────
-# Used for Section 5: classifying funds as reimbursable vs non-reimbursable
-# when expenditures exceed revenue.
-#
-# Non-Reimbursable: local/operational funds where spending > revenue is a real
-# cash concern. Reimbursable: federal/state flow-through grants where spending
-# typically precedes reimbursement.
-#
-# Classification is by leading digits of the fund code. Order matters —
-# first match wins.
-
 FUND_CLASSIFICATION = {
-    # Non-Reimbursable (real cash concerns)
-    "11": "Non-Reimbursable",   # Operational
-    "13": "Non-Reimbursable",   # Transportation
-    "14": "Non-Reimbursable",   # Instructional Materials
-    "21": "Non-Reimbursable",   # Food Services (local revenue-backed)
-    "23": "Non-Reimbursable",   # Non-Instructional Support
-    "31": "Non-Reimbursable",   # Debt Service (Bond)
-    "32": "Non-Reimbursable",   # Debt Service (other)
-    "41": "Non-Reimbursable",   # Capital Improvements HB-33
-    "42": "Non-Reimbursable",   # Capital Improvements SB-9
-    "43": "Non-Reimbursable",   # Capital (other local)
-
-    # Reimbursable (expected: spend first, reimbursed later)
-    "24": "Reimbursable",       # Federal Flow-Through (IDEA-B, Title I, etc.)
-    "25": "Reimbursable",       # State Flow-Through
-    "26": "Reimbursable",       # Federal Direct Grants
-    "27": "Reimbursable",       # State Direct Appropriations
-    "28": "Reimbursable",       # Federal Stimulus (ESSER, etc.)
-    "29": "Reimbursable",       # State/Other Grants
+    "11": "Non-Reimbursable", "13": "Non-Reimbursable", "14": "Non-Reimbursable",
+    "21": "Non-Reimbursable", "23": "Non-Reimbursable",
+    "31": "Non-Reimbursable", "32": "Non-Reimbursable",
+    "41": "Non-Reimbursable", "42": "Non-Reimbursable", "43": "Non-Reimbursable",
+    "24": "Reimbursable", "25": "Reimbursable", "26": "Reimbursable",
+    "27": "Reimbursable", "28": "Reimbursable", "29": "Reimbursable",
 }
 
 
 def classify_fund(fund_str):
-    """Classify a fund string like '11000 - Operational' as Reimbursable or Non-Reimbursable."""
     code = extract_code(str(fund_str))
     for prefix, classification in FUND_CLASSIFICATION.items():
         if code.startswith(prefix):
@@ -225,7 +207,6 @@ def classify_fund(fund_str):
 
 # ── Google Drive File Registry ───────────────────────────────────────────────
 GDRIVE_FILES = {
-    # Actuals
     "actuals_0607": "1tRjPX98VYEU9hA8KpOxoe4g16gz7XzF7",
     "actuals_0708": "1O02w9W496AGDy6RiNCO3jcDRas6S5wc8",
     "actuals_0809": "17Qwl1VERONBkkjJ8cQi_8KuBJfg-Ob3N",
@@ -246,7 +227,6 @@ GDRIVE_FILES = {
     "actuals_2324": "15aR7lFEuj-NvF33L22GsWe0guI4Hyzrp",
     "actuals_2425": "1FZsV_4CKhPhl8kFFdG4IodTv8XRe3_Sz",
     "actuals_2526": "1B1VTimEWzn7m0rY1Y_UjDbobb4dBtzUg",
-    # Budget
     "budget_0607": "132sgPwq4mTX2uTk_pJbna_WwM2uGm9P2",
     "budget_0708": "1hxS4Zs8qnkbmtz37Cya8YjFmUdurt2TB",
     "budget_0809": "19d8C_OlO1pbbpe9TGnGVlNPqAJUDFzXC",
@@ -271,34 +251,24 @@ GDRIVE_FILES = {
 
 
 def gdrive_download_url(file_id: str) -> str:
-    """Convert a Google Drive file ID to a direct download URL."""
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 # ── Fiscal Year Helpers ──────────────────────────────────────────────────────
-ALL_FY_CODES = sorted(set(
-    k.split("_")[1] for k in GDRIVE_FILES.keys()
-))
+ALL_FY_CODES = sorted(set(k.split("_")[1] for k in GDRIVE_FILES.keys()))
 
 def fy_key_to_code(fy_key: int) -> str:
-    """Convert FiscalYearKey like 2025 to FY code like '2425'."""
     return f"{(fy_key-1) % 100:02d}{fy_key % 100:02d}"
 
 def fy_code_to_key(fy_code: str) -> int:
-    """Convert FY code like '2425' to FiscalYearKey like 2025."""
     return 2000 + int(fy_code[2:4])
 
 ALL_FY_KEYS = sorted([fy_code_to_key(c) for c in ALL_FY_CODES])
-DIM_FISCAL = pd.DataFrame([{
-    "FiscalYearKey": k,
-    "FiscalYear": fy_key_to_code(k),
-    "FiscalYearLabel": f"{k-1}–{k}"
-} for k in ALL_FY_KEYS])
+FY_LABELS = {k: f"{k-1}–{k}" for k in ALL_FY_KEYS}
 
 
 @st.cache_data(ttl=3600)
 def load_single_parquet(file_key: str) -> pd.DataFrame:
-    """Load a single parquet file from Google Drive. Cached per file."""
     file_id = GDRIVE_FILES.get(file_key)
     if not file_id:
         return pd.DataFrame()
@@ -310,14 +280,10 @@ def load_single_parquet(file_key: str) -> pd.DataFrame:
 
 
 def load_data_for_years(fy_keys: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load actuals and budget data only for the selected fiscal years."""
-    actuals_dfs = []
-    budget_dfs = []
-
+    actuals_dfs, budget_dfs = [], []
     fy_codes = [fy_key_to_code(k) for k in fy_keys]
     files_to_load = [f"{t}_{c}" for c in fy_codes for t in ["actuals", "budget"]
                      if f"{t}_{c}" in GDRIVE_FILES]
-
     if not files_to_load:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -339,7 +305,6 @@ def load_data_for_years(fy_keys: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]
 
 # ── Helper Functions ─────────────────────────────────────────────────────────
 def fmt_currency(val, compact=False):
-    """Format a number as currency."""
     if pd.isna(val):
         return "$0"
     if compact:
@@ -352,106 +317,8 @@ def fmt_currency(val, compact=False):
     return f"${val:,.0f}"
 
 
-def fmt_pct(val):
-    if pd.isna(val) or val == float('inf') or val == float('-inf'):
-        return "N/A"
-    return f"{val:.1f}%"
-
-
-def extract_code(text):
-    """Extract leading numeric code from strings like '11000 - Operational'."""
-    if pd.isna(text):
-        return ""
-    parts = str(text).split(" - ", 1)
-    return parts[0].strip()
-
-
-def extract_name(text):
-    """Extract name portion from strings like '11000 - Operational'."""
-    if pd.isna(text):
-        return ""
-    parts = str(text).split(" - ", 1)
-    return parts[1].strip() if len(parts) > 1 else parts[0].strip()
-
-
-def to_excel_download(df, sheet_name="Data"):
-    """Convert DataFrame to downloadable Excel bytes."""
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-    return output.getvalue()
-
-
-def apply_filters(act, bud, account_type, period, entities, funds, functions, objects, programs):
-    """Apply user-selected filters to both fact tables."""
-    a = act
-    if account_type:
-        a = a[a["Account Type"] == account_type]
-    if period:
-        a = a[a["Reporting Period"] == period]
-    if entities:
-        a = a[a["Budget Entity"].isin(entities)]
-    if funds:
-        a = a[a["Fund"].isin(funds)]
-    if functions:
-        a = a[a["Function"].isin(functions)]
-    if objects:
-        a = a[a["Object"].isin(objects)]
-    if programs:
-        a = a[a["Program"].isin(programs)]
-
-    b = bud
-    if account_type:
-        b = b[b["Account Type"] == account_type]
-    if entities:
-        b = b[b["Budget Entity"].isin(entities)]
-    if funds:
-        b = b[b["Fund"].isin(funds)]
-    if functions:
-        b = b[b["Function"].isin(functions)]
-    if objects:
-        b = b[b["Object"].isin(objects)]
-    if programs:
-        b = b[b["Program"].isin(programs)]
-
-    return a, b
-
-
-def compute_budget_vs_actuals(act_filtered, bud_filtered, group_col):
-    """Compute budget vs actuals comparison grouped by a dimension."""
-    b_agg = bud_filtered.groupby(group_col).agg(
-        Adjusted_Budget=("Adjusted Amt", "sum"),
-        Final_Budget=("Final Amt", "sum"),
-        Budget_FTE=("Final FTE", "sum")
-    ).reset_index()
-
-    a_agg = act_filtered.groupby(group_col).agg(
-        YTD_Actuals=("Actuals YTDAmount", "sum"),
-        Period_Actuals=("Actuals Period Amount", "sum"),
-        Encumbrance=("Actuals Encumbrance", "sum"),
-        Actuals_FTE=("Actuals FTE", "sum")
-    ).reset_index()
-
-    merged = b_agg.merge(a_agg, on=group_col, how="outer").fillna(0)
-    merged["Budget_Balance"] = merged["Adjusted_Budget"] - merged["YTD_Actuals"] - merged["Encumbrance"]
-    merged["Pct_Spent"] = (merged["YTD_Actuals"] / merged["Adjusted_Budget"].replace(0, float("nan")) * 100)
-    merged["Pct_Committed"] = ((merged["YTD_Actuals"] + merged["Encumbrance"]) /
-                                merged["Adjusted_Budget"].replace(0, float("nan")) * 100)
-
-    return merged.sort_values("Adjusted_Budget", ascending=False)
-
-
-# ── District Report Helpers ──────────────────────────────────────────────────
-REPORT_DIMS = ["Budget Entity", "Fund", "Function", "Object", "Program", "Job Class"]
-
-REPORT_CSV_COLS = [
-    "Entity", "Fund", "Function", "Object", "Program", "JobClass",
-    "Actuals Period Amount", "Actuals YTD", "Encumbrance", "Actuals FTE",
-    "Adjusted Budget", "Adjusted FTE", "Available Balance", "Burn % (Actuals + Enc)"
-]
-
-
-def _fmt_acct_currency(val):
+def fmt_acct_currency(val):
+    """Format currency for accounting exports: $1,234.56 or ($1,234.56) for negatives."""
     if pd.isna(val):
         return ""
     if val < 0:
@@ -459,14 +326,122 @@ def _fmt_acct_currency(val):
     return f"${val:,.2f}"
 
 
-def _fmt_acct_pct(val):
-    if pd.isna(val):
+def fmt_pct(val):
+    if pd.isna(val) or val == float('inf') or val == float('-inf'):
+        return "N/A"
+    return f"{val:.1f}%"
+
+
+def extract_code(text):
+    if pd.isna(text):
         return ""
-    return f"{val:.2f}%"
+    return str(text).split(" - ", 1)[0].strip()
 
 
-def build_district_report(act_df, bud_df, entity_name, account_type):
-    """Build a line-item report for a single entity matching quarterly review CSV format."""
+def extract_name(text):
+    if pd.isna(text):
+        return ""
+    parts = str(text).split(" - ", 1)
+    return parts[1].strip() if len(parts) > 1 else parts[0].strip()
+
+
+def to_excel_download(df, sheet_name="Data"):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return output.getvalue()
+
+
+# ── OBMS Dimension Columns ──────────────────────────────────────────────────
+# Full OBMS string: Fund, Function, Object, Program, Location, Job Class
+OBMS_DIMS = ["Budget Entity", "Fund", "Function", "Object", "Program", "Location", "Job Class"]
+# Filterable dimensions (excludes entity which is global)
+FILTER_DIMS = ["Fund", "Function", "Object", "Program", "Location", "Job Class"]
+
+
+def get_unique_values(act_df, bud_df, col):
+    """Get sorted unique values for a dimension across both datasets."""
+    vals = set()
+    if len(act_df) > 0 and col in act_df.columns:
+        vals.update(act_df[col].dropna().unique())
+    if len(bud_df) > 0 and col in bud_df.columns:
+        vals.update(bud_df[col].dropna().unique())
+    return sorted(vals)
+
+
+def apply_dim_filters(df, filters: dict) -> pd.DataFrame:
+    """Apply a dictionary of {column: [values]} filters to a DataFrame."""
+    if len(df) == 0:
+        return df
+    for col, vals in filters.items():
+        if vals and col in df.columns:
+            df = df[df[col].isin(vals)]
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUDGET AUTHORITY REPORT BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+def build_budget_report(bud_df, entity_name, account_type):
+    """
+    Build budget authority CSV matching the exact format:
+    Entity, Fund, Function, Object, Program, Location, JobClass,
+    Beginning Budget, Beginning FTE, Adjustment Amount, Adjustment FTE,
+    Adjusted Budget, Adjusted FTE
+    """
+    b = bud_df[
+        (bud_df["Budget Entity"] == entity_name) &
+        (bud_df["Account Type"] == account_type)
+    ].copy()
+
+    if len(b) == 0:
+        return pd.DataFrame(columns=[
+            "Entity", "Fund", "Function", "Object", "Program", "Location", "JobClass",
+            "Beginning Budget", "Beginning FTE", "Adjustment Amount", "Adjustment FTE",
+            "Adjusted Budget", "Adjusted FTE"
+        ])
+
+    agg = b.groupby(OBMS_DIMS, dropna=False).agg(
+        beg_budget=("Final Amt", "sum"),
+        beg_fte=("Final FTE", "sum"),
+        adj_amt=("Adjustment Amt", "sum"),
+        adj_fte=("Adjustment FTE", "sum"),
+        adj_budget=("Adjusted Amt", "sum"),
+        adjusted_fte=("Adjusted FTE", "sum"),
+    ).reset_index()
+
+    agg = agg.sort_values(OBMS_DIMS).reset_index(drop=True)
+
+    report = pd.DataFrame()
+    report["Entity"] = agg["Budget Entity"]
+    report["Fund"] = agg["Fund"]
+    report["Function"] = agg["Function"]
+    report["Object"] = agg["Object"]
+    report["Program"] = agg["Program"]
+    report["Location"] = agg["Location"]
+    report["JobClass"] = agg["Job Class"]
+    report["Beginning Budget"] = agg["beg_budget"].apply(fmt_acct_currency)
+    report["Beginning FTE"] = agg["beg_fte"].apply(lambda v: f"{v:.2f}")
+    report["Adjustment Amount"] = agg["adj_amt"].apply(fmt_acct_currency)
+    report["Adjustment FTE"] = agg["adj_fte"].apply(lambda v: f"{v:.2f}")
+    report["Adjusted Budget"] = agg["adj_budget"].apply(fmt_acct_currency)
+    report["Adjusted FTE"] = agg["adjusted_fte"].apply(lambda v: f"{v:.2f}")
+
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTUALS REPORT BUILDER (updated with Location)
+# ══════════════════════════════════════════════════════════════════════════════
+ACTUALS_CSV_COLS = [
+    "Entity", "Fund", "Function", "Object", "Program", "Location", "JobClass",
+    "Actuals Period Amount", "Actuals YTD", "Encumbrance", "Actuals FTE",
+    "Adjusted Budget", "Adjusted FTE", "Available Balance", "Burn % (Actuals + Enc)"
+]
+
+
+def build_actuals_report(act_df, bud_df, entity_name, account_type):
+    """Build line-item actuals report with full OBMS string including Location."""
     act = act_df[
         (act_df["Budget Entity"] == entity_name) &
         (act_df["Account Type"] == account_type)
@@ -478,27 +453,27 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
     ].copy()
 
     if len(act) == 0 and len(bud) == 0:
-        return pd.DataFrame(columns=REPORT_CSV_COLS)
+        return pd.DataFrame(columns=ACTUALS_CSV_COLS)
 
     if len(act) > 0:
-        a_agg = act.groupby(REPORT_DIMS, dropna=False).agg(
+        a_agg = act.groupby(OBMS_DIMS, dropna=False).agg(
             period_amt=("Actuals Period Amount", "sum"),
             ytd_amt=("Actuals YTDAmount", "sum"),
             enc_amt=("Actuals Encumbrance", "sum"),
             act_fte=("Actuals FTE", "sum"),
         ).reset_index()
     else:
-        a_agg = pd.DataFrame(columns=REPORT_DIMS + ["period_amt", "ytd_amt", "enc_amt", "act_fte"])
+        a_agg = pd.DataFrame(columns=OBMS_DIMS + ["period_amt", "ytd_amt", "enc_amt", "act_fte"])
 
     if len(bud) > 0:
-        b_agg = bud.groupby(REPORT_DIMS, dropna=False).agg(
+        b_agg = bud.groupby(OBMS_DIMS, dropna=False).agg(
             adj_budget=("Adjusted Amt", "sum"),
-            adj_fte=("Final FTE", "sum"),
+            adj_fte=("Adjusted FTE", "sum"),
         ).reset_index()
     else:
-        b_agg = pd.DataFrame(columns=REPORT_DIMS + ["adj_budget", "adj_fte"])
+        b_agg = pd.DataFrame(columns=OBMS_DIMS + ["adj_budget", "adj_fte"])
 
-    merged = b_agg.merge(a_agg, on=REPORT_DIMS, how="outer")
+    merged = b_agg.merge(a_agg, on=OBMS_DIMS, how="outer")
 
     merged["avail_balance"] = (
         merged["adj_budget"].fillna(0)
@@ -506,20 +481,16 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
         - merged["enc_amt"].fillna(0)
     )
 
-    has_actuals = merged["ytd_amt"].notna() | merged["enc_amt"].notna()
     has_budget = merged["adj_budget"].notna() & (merged["adj_budget"] != 0)
+    has_actuals = merged["ytd_amt"].notna() | merged["enc_amt"].notna()
     merged["burn_pct"] = pd.NA
     mask = has_actuals & has_budget
     merged.loc[mask, "burn_pct"] = (
         (merged.loc[mask, "ytd_amt"].fillna(0) + merged.loc[mask, "enc_amt"].fillna(0))
-        / merged.loc[mask, "adj_budget"]
-        * 100
+        / merged.loc[mask, "adj_budget"] * 100
     )
 
-    merged = merged.sort_values(REPORT_DIMS).reset_index(drop=True)
-
-    actuals_present = merged["ytd_amt"].notna() | merged["enc_amt"].notna()
-    budget_present = merged["adj_budget"].notna()
+    merged = merged.sort_values(OBMS_DIMS).reset_index(drop=True)
 
     report = pd.DataFrame()
     report["Entity"] = merged["Budget Entity"]
@@ -527,628 +498,110 @@ def build_district_report(act_df, bud_df, entity_name, account_type):
     report["Function"] = merged["Function"]
     report["Object"] = merged["Object"]
     report["Program"] = merged["Program"]
+    report["Location"] = merged["Location"]
     report["JobClass"] = merged["Job Class"]
 
     report["Actuals Period Amount"] = merged["period_amt"].apply(
-        lambda v: _fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else _fmt_acct_currency(v))
+        lambda v: fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else fmt_acct_currency(v))
     )
     report["Actuals YTD"] = merged["ytd_amt"].apply(
-        lambda v: _fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else _fmt_acct_currency(v))
+        lambda v: fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else fmt_acct_currency(v))
     )
     report["Encumbrance"] = merged["enc_amt"].apply(
-        lambda v: _fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else _fmt_acct_currency(v))
+        lambda v: fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else fmt_acct_currency(v))
     )
     report["Actuals FTE"] = merged["act_fte"].apply(
         lambda v: "" if pd.isna(v) else f"{v:.2f}" if v != 0 else "0.00"
     )
-
     report["Adjusted Budget"] = merged["adj_budget"].apply(
-        lambda v: _fmt_acct_currency(v) if pd.notna(v) else ""
+        lambda v: fmt_acct_currency(v) if pd.notna(v) else ""
     )
     report["Adjusted FTE"] = merged["adj_fte"].apply(
         lambda v: "" if pd.isna(v) else f"{v:.2f}" if v != 0 else "0.00"
     )
+    report["Available Balance"] = merged["avail_balance"].apply(fmt_acct_currency)
+    report["Burn % (Actuals + Enc)"] = merged["burn_pct"].apply(
+        lambda v: "" if pd.isna(v) else f"{v:.2f}%"
+    )
 
-    report["Available Balance"] = merged["avail_balance"].apply(_fmt_acct_currency)
-    report["Burn % (Actuals + Enc)"] = merged["burn_pct"].apply(_fmt_acct_pct)
-
-    budget_only_mask = ~actuals_present
+    # Blank out actuals cols for budget-only rows
+    budget_only = ~has_actuals
     for col in ["Actuals Period Amount", "Actuals YTD", "Encumbrance", "Actuals FTE"]:
-        report.loc[budget_only_mask, col] = ""
+        report.loc[budget_only, col] = ""
 
-    actuals_only_mask = ~budget_present
+    actuals_only = ~has_budget
     for col in ["Adjusted Budget", "Adjusted FTE"]:
-        report.loc[actuals_only_mask, col] = ""
+        report.loc[actuals_only, col] = ""
 
     return report
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Entity Analysis Functions (Sections 4–7)
+# SALARY / BENEFITS CLASSIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
-
-def compute_entity_rev_vs_exp(act_df, bud_df, entity_name):
-    """
-    Section 4: Revenue vs Expenditure by Fund.
-    Returns a DataFrame with fund-level revenue and expenditure YTD totals.
-    """
-    # Revenue actuals for entity
-    rev_act = act_df[
-        (act_df["Budget Entity"] == entity_name) &
-        (act_df["Account Type"] == "R")
-    ].groupby("Fund").agg(Revenue_YTD=("Actuals YTDAmount", "sum")).reset_index()
-
-    # Expenditure actuals for entity
-    exp_act = act_df[
-        (act_df["Budget Entity"] == entity_name) &
-        (act_df["Account Type"] == "E")
-    ].groupby("Fund").agg(Expenditure_YTD=("Actuals YTDAmount", "sum")).reset_index()
-
-    merged = rev_act.merge(exp_act, on="Fund", how="outer").fillna(0)
-    merged["Net"] = merged["Revenue_YTD"] - merged["Expenditure_YTD"]
-    merged["Total_Activity"] = merged["Revenue_YTD"].abs() + merged["Expenditure_YTD"].abs()
-    merged["Fund_Name"] = merged["Fund"].apply(extract_name)
-    merged["Fund_Code"] = merged["Fund"].apply(extract_code)
-    merged["Fund_Class"] = merged["Fund"].apply(classify_fund)
-
-    return merged.sort_values("Total_Activity", ascending=False)
+# Object codes 51xxx = Salaries, 52xxx = Benefits, 53xxx = Contracted Services
+def classify_object_category(obj_str):
+    code = extract_code(str(obj_str))
+    if code.startswith("51"):
+        return "Salaries"
+    elif code.startswith("52"):
+        return "Benefits"
+    elif code.startswith("53"):
+        return "Contracted Services"
+    elif code.startswith("54"):
+        return "Other Purchased Services"
+    elif code.startswith("55"):
+        return "Supplies"
+    elif code.startswith("56"):
+        return "Property"
+    else:
+        return "Other"
 
 
-def compute_funds_exp_exceed_rev(rev_exp_df):
-    """
-    Section 5: Funds where expenditures exceed revenue.
-    Split into Non-Reimbursable (real concern) and Reimbursable (expected).
-    """
-    deficit = rev_exp_df[rev_exp_df["Net"] < 0].copy()
-    deficit["Deficit"] = deficit["Net"].abs()
-
-    non_reimb = deficit[deficit["Fund_Class"] == "Non-Reimbursable"].sort_values("Deficit", ascending=False)
-    reimb = deficit[deficit["Fund_Class"] == "Reimbursable"].sort_values("Deficit", ascending=False)
-    other = deficit[deficit["Fund_Class"] == "Other"].sort_values("Deficit", ascending=False)
-
-    return non_reimb, reimb, other
-
-
-def compute_exp_by_fund_type(act_df, entity_name):
-    """
-    Section 6: Expenditure distribution by fund.
-    Returns fund-level YTD expenditure totals for donut chart + table.
-    """
-    exp = act_df[
-        (act_df["Budget Entity"] == entity_name) &
-        (act_df["Account Type"] == "E")
-    ].groupby("Fund").agg(
-        YTD_Actuals=("Actuals YTDAmount", "sum")
-    ).reset_index()
-
-    exp["Fund_Name"] = exp["Fund"].apply(extract_name)
-    exp["Fund_Code"] = exp["Fund"].apply(extract_code)
-    exp["Fund_Class"] = exp["Fund"].apply(classify_fund)
-    total = exp["YTD_Actuals"].sum()
-    exp["Pct_of_Total"] = (exp["YTD_Actuals"] / total * 100) if total > 0 else 0
-
-    return exp.sort_values("YTD_Actuals", ascending=False)
-
-
-def compute_exp_by_function(act_df, bud_df, entity_name):
-    """
-    Section 7: Expenditure by function with budget/actuals/encumbrance.
-    Returns function-level comparison for horizontal bar + table.
-    """
-    exp_act = act_df[
-        (act_df["Budget Entity"] == entity_name) &
-        (act_df["Account Type"] == "E")
-    ].groupby("Function").agg(
-        YTD_Actuals=("Actuals YTDAmount", "sum"),
-        Encumbrance=("Actuals Encumbrance", "sum"),
-    ).reset_index()
-
-    exp_bud = bud_df[
-        (bud_df["Budget Entity"] == entity_name) &
-        (bud_df["Account Type"] == "E")
-    ].groupby("Function").agg(
-        Adjusted_Budget=("Adjusted Amt", "sum"),
-    ).reset_index()
-
-    merged = exp_bud.merge(exp_act, on="Function", how="outer").fillna(0)
-    merged["Available"] = merged["Adjusted_Budget"] - merged["YTD_Actuals"] - merged["Encumbrance"]
-    merged["Pct_Used"] = (
-        (merged["YTD_Actuals"] + merged["Encumbrance"])
-        / merged["Adjusted_Budget"].replace(0, float("nan"))
-        * 100
-    )
-    merged["Function_Name"] = merged["Function"].apply(extract_name)
-    merged["Function_Code"] = merged["Function"].apply(extract_code)
-
-    return merged.sort_values("Adjusted_Budget", ascending=False)
+def classify_function_category(func_str):
+    code = extract_code(str(func_str))
+    if code.startswith("1"):
+        return "Instruction"
+    elif code.startswith("21"):
+        return "Support - Students"
+    elif code.startswith("22"):
+        return "Support - Instruction"
+    elif code.startswith("23"):
+        return "General Administration"
+    elif code.startswith("24"):
+        return "School Administration"
+    elif code.startswith("25"):
+        return "Central Services"
+    elif code.startswith("26"):
+        return "Operations & Maintenance"
+    elif code.startswith("27"):
+        return "Student Transportation"
+    elif code.startswith("3"):
+        return "Food Services"
+    elif code.startswith("4"):
+        return "Capital Outlay"
+    elif code.startswith("5"):
+        return "Debt Service"
+    else:
+        return "Other"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HTML Export Builder
+# SIDEBAR: Global Filters (Entity + FY + Period)
 # ══════════════════════════════════════════════════════════════════════════════
-
-def build_html_report(entity_name, fy_label, period_label, rev_exp_df,
-                      non_reimb_df, reimb_df, other_df,
-                      fund_dist_df, func_df, summary_stats):
-    """
-    Generate a standalone HTML report in the cream/Playfair Display style
-    matching the quarterly review format. Includes Chart.js charts.
-    """
-    # Prepare chart data
-    # Section 4: Rev vs Exp bar chart — top 12 funds
-    top_funds_chart = rev_exp_df.head(12)
-    chart_labels = [extract_name(f) for f in top_funds_chart["Fund"]]
-    chart_rev = top_funds_chart["Revenue_YTD"].tolist()
-    chart_exp = top_funds_chart["Expenditure_YTD"].tolist()
-
-    # Section 6: Donut chart — fund distribution
-    fund_donut = fund_dist_df[fund_dist_df["YTD_Actuals"] > 0].head(10)
-    donut_labels = fund_donut["Fund_Name"].tolist()
-    donut_values = fund_donut["YTD_Actuals"].tolist()
-
-    # Section 7: Function bar chart
-    func_chart = func_df[func_df["Adjusted_Budget"] > 0].head(12)
-    func_labels = func_chart["Function_Name"].tolist()
-    func_actuals = func_chart["YTD_Actuals"].tolist()
-    func_enc = func_chart["Encumbrance"].tolist()
-    func_avail = func_chart["Available"].clip(lower=0).tolist()
-
-    # Build deficit fund tables
-    def _fund_deficit_rows(df):
-        rows = ""
-        for _, r in df.iterrows():
-            status_color = "#b91c1c" if r["Deficit"] > 100_000 else "#d97706" if r["Deficit"] > 10_000 else "#65a30d"
-            rows += f"""<tr>
-                <td>{r['Fund']}</td>
-                <td style="text-align:right">${r['Revenue_YTD']:,.0f}</td>
-                <td style="text-align:right">${r['Expenditure_YTD']:,.0f}</td>
-                <td style="text-align:right;color:{status_color};font-weight:600">({_fmt_acct_currency(r['Deficit'])})</td>
-                <td><span style="background:{status_color};color:white;padding:2px 10px;border-radius:12px;font-size:0.8rem;">
-                    {'High' if r['Deficit'] > 100_000 else 'Monitor' if r['Deficit'] > 10_000 else 'Low'}</span></td>
-            </tr>"""
-        return rows
-
-    # Build function table
-    func_table_rows = ""
-    for _, r in func_df.iterrows():
-        if r["Adjusted_Budget"] == 0 and r["YTD_Actuals"] == 0:
-            continue
-        pct_str = f"{r['Pct_Used']:.1f}%" if pd.notna(r["Pct_Used"]) else "N/A"
-        pct_color = "#b91c1c" if pd.notna(r["Pct_Used"]) and r["Pct_Used"] > 90 else "#d97706" if pd.notna(r["Pct_Used"]) and r["Pct_Used"] > 70 else "#1e3a5f"
-        func_table_rows += f"""<tr>
-            <td>{r['Function']}</td>
-            <td style="text-align:right">${r['Adjusted_Budget']:,.0f}</td>
-            <td style="text-align:right">${r['YTD_Actuals']:,.0f}</td>
-            <td style="text-align:right">${r['Encumbrance']:,.0f}</td>
-            <td style="text-align:right">${r['Available']:,.0f}</td>
-            <td style="text-align:right;color:{pct_color};font-weight:600">{pct_str}</td>
-        </tr>"""
-
-    # Fund distribution table
-    fund_table_rows = ""
-    for _, r in fund_dist_df.head(10).iterrows():
-        fund_table_rows += f"""<tr>
-            <td>{r['Fund']}</td>
-            <td style="text-align:right">${r['YTD_Actuals']:,.0f}</td>
-            <td style="text-align:right">{r['Pct_of_Total']:.1f}%</td>
-        </tr>"""
-
-    review_date = datetime.now().strftime("%B %d, %Y")
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{entity_name} — {fy_label} Actuals Analysis</title>
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Source+Sans+3:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
-<style>
-    :root {{
-        --navy: #1e3a5f;
-        --gold: #c9a96e;
-        --red: #b91c1c;
-        --amber: #d97706;
-        --green: #65a30d;
-        --cream: #faf9f7;
-        --card-bg: #ffffff;
-        --text: #2d3748;
-        --text-light: #718096;
-        --border: #e8e4df;
-    }}
-    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    body {{
-        font-family: 'Source Sans 3', sans-serif;
-        background: var(--cream);
-        color: var(--text);
-        line-height: 1.6;
-        padding: 40px;
-    }}
-    .header {{
-        text-align: center;
-        margin-bottom: 40px;
-        padding-bottom: 24px;
-        border-bottom: 3px solid var(--navy);
-    }}
-    .header h1 {{
-        font-family: 'Playfair Display', serif;
-        font-size: 2rem;
-        color: var(--navy);
-        margin-bottom: 4px;
-    }}
-    .header h2 {{
-        font-family: 'Playfair Display', serif;
-        font-size: 1.2rem;
-        color: var(--gold);
-        font-weight: 400;
-        margin-bottom: 8px;
-    }}
-    .header .meta {{
-        font-size: 0.9rem;
-        color: var(--text-light);
-    }}
-    .section {{
-        margin-bottom: 36px;
-    }}
-    .section h3 {{
-        font-family: 'Playfair Display', serif;
-        font-size: 1.3rem;
-        color: var(--navy);
-        margin-bottom: 16px;
-        padding-bottom: 6px;
-        border-bottom: 2px solid var(--gold);
-        display: inline-block;
-    }}
-    .cards {{
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-        gap: 16px;
-        margin-bottom: 24px;
-    }}
-    .card {{
-        background: var(--card-bg);
-        border-radius: 10px;
-        padding: 20px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        border-left: 4px solid var(--navy);
-    }}
-    .card .label {{
-        font-size: 0.8rem;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--text-light);
-        margin-bottom: 4px;
-    }}
-    .card .value {{
-        font-size: 1.6rem;
-        font-weight: 700;
-        color: var(--navy);
-    }}
-    .card.accent-gold {{ border-left-color: var(--gold); }}
-    .card.accent-red {{ border-left-color: var(--red); }}
-    .card.accent-green {{ border-left-color: var(--green); }}
-    table {{
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 0.9rem;
-        background: var(--card-bg);
-        border-radius: 8px;
-        overflow: hidden;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-    }}
-    th {{
-        background: var(--navy);
-        color: white;
-        padding: 10px 14px;
-        text-align: left;
-        font-weight: 600;
-        font-size: 0.82rem;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-    }}
-    td {{
-        padding: 8px 14px;
-        border-bottom: 1px solid var(--border);
-    }}
-    tr:last-child td {{ border-bottom: none; }}
-    tr:hover {{ background: #f7f5f2; }}
-    .chart-container {{
-        background: var(--card-bg);
-        border-radius: 10px;
-        padding: 20px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        margin-bottom: 20px;
-    }}
-    .two-col {{
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 24px;
-    }}
-    @media (max-width: 768px) {{
-        .two-col {{ grid-template-columns: 1fr; }}
-        body {{ padding: 16px; }}
-    }}
-    .footer {{
-        margin-top: 40px;
-        padding-top: 20px;
-        border-top: 2px solid var(--border);
-        font-size: 0.82rem;
-        color: var(--text-light);
-        text-align: center;
-    }}
-    .sub-header {{
-        font-family: 'Playfair Display', serif;
-        font-size: 1.05rem;
-        color: var(--navy);
-        margin: 16px 0 10px 0;
-        font-weight: 600;
-    }}
-    .no-data {{
-        color: var(--text-light);
-        font-style: italic;
-        padding: 12px;
-    }}
-</style>
-</head>
-<body>
-
-<div class="header">
-    <h1>{entity_name}</h1>
-    <h2>{fy_label} Actuals Analysis Dashboard</h2>
-    <div class="meta">Review Date: {review_date} · NM Public Education Department / School Budget Bureau</div>
-</div>
-
-<!-- Section 1: Executive Summary -->
-<div class="section">
-    <h3>Executive Summary</h3>
-    <div class="cards">
-        <div class="card">
-            <div class="label">Revenue YTD</div>
-            <div class="value">{fmt_currency(summary_stats['rev_ytd'], compact=True)}</div>
-        </div>
-        <div class="card accent-gold">
-            <div class="label">Expenditure YTD</div>
-            <div class="value">{fmt_currency(summary_stats['exp_ytd'], compact=True)}</div>
-        </div>
-        <div class="card {'accent-green' if summary_stats['net'] >= 0 else 'accent-red'}">
-            <div class="label">Net (Rev − Exp)</div>
-            <div class="value">{fmt_currency(summary_stats['net'], compact=True)}</div>
-        </div>
-        <div class="card">
-            <div class="label">Exp. Adjusted Budget</div>
-            <div class="value">{fmt_currency(summary_stats['exp_budget'], compact=True)}</div>
-        </div>
-    </div>
-</div>
-
-<!-- Section 4: Revenue vs Expenditure by Fund -->
-<div class="section">
-    <h3>Revenue vs. Expenditure Analysis</h3>
-    <div class="chart-container">
-        <canvas id="revExpChart" height="320"></canvas>
-    </div>
-</div>
-
-<!-- Section 5: Funds Where Expenditures Exceed Revenue -->
-<div class="section">
-    <h3>Funds Where Expenditures Exceed Revenue</h3>
-
-    <div class="sub-header">Non-Reimbursable Funds</div>
-    {'<p class="no-data">No non-reimbursable funds with expenditures exceeding revenue.</p>' if len(non_reimb_df) == 0 else f"""
-    <table>
-        <thead><tr><th>Fund</th><th style="text-align:right">Revenue YTD</th><th style="text-align:right">Expenditure YTD</th><th style="text-align:right">Net</th><th>Status</th></tr></thead>
-        <tbody>{_fund_deficit_rows(non_reimb_df)}</tbody>
-    </table>"""}
-
-    <div class="sub-header" style="margin-top:24px">Reimbursable Funds (Expected Behavior)</div>
-    {'<p class="no-data">No reimbursable funds with expenditures exceeding revenue.</p>' if len(reimb_df) == 0 else f"""
-    <table>
-        <thead><tr><th>Fund</th><th style="text-align:right">Revenue YTD</th><th style="text-align:right">Expenditure YTD</th><th style="text-align:right">Net</th><th>Status</th></tr></thead>
-        <tbody>{_fund_deficit_rows(reimb_df)}</tbody>
-    </table>"""}
-
-    {"" if len(other_df) == 0 else f'''
-    <div class="sub-header" style="margin-top:24px">Other / Unclassified Funds</div>
-    <table>
-        <thead><tr><th>Fund</th><th style="text-align:right">Revenue YTD</th><th style="text-align:right">Expenditure YTD</th><th style="text-align:right">Net</th><th>Status</th></tr></thead>
-        <tbody>{_fund_deficit_rows(other_df)}</tbody>
-    </table>'''}
-</div>
-
-<!-- Section 6: Expenditure Distribution by Fund -->
-<div class="section">
-    <h3>Expenditure Distribution by Fund</h3>
-    <div class="two-col">
-        <div class="chart-container">
-            <canvas id="fundDonut" height="300"></canvas>
-        </div>
-        <div>
-            <table>
-                <thead><tr><th>Fund</th><th style="text-align:right">YTD Spend</th><th style="text-align:right">% of Total</th></tr></thead>
-                <tbody>{fund_table_rows}</tbody>
-            </table>
-        </div>
-    </div>
-</div>
-
-<!-- Section 7: Expenditure by Function -->
-<div class="section">
-    <h3>Expenditure by Function</h3>
-    <div class="chart-container">
-        <canvas id="funcChart" height="350"></canvas>
-    </div>
-    <table style="margin-top:16px">
-        <thead><tr>
-            <th>Function</th><th style="text-align:right">Budget</th>
-            <th style="text-align:right">YTD Actuals</th><th style="text-align:right">Encumbered</th>
-            <th style="text-align:right">Available</th><th style="text-align:right">% Used (Act+Enc)</th>
-        </tr></thead>
-        <tbody>{func_table_rows}</tbody>
-    </table>
-</div>
-
-<div class="footer">
-    <p>NM Public Education Department · School Budget Bureau</p>
-    <p style="margin-top:4px;font-size:0.78rem;">
-        This review is conducted pursuant to NMAC 6.20.2 and does not constitute an audit.
-    </p>
-</div>
-
-<script>
-// Color palette
-const navy = '#1e3a5f';
-const gold = '#c9a96e';
-const red  = '#b91c1c';
-const teal = '#2dd4bf';
-const amber = '#d97706';
-const green = '#65a30d';
-const violet = '#6366f1';
-
-const palette = [navy, gold, '#4f8df5', teal, amber, red, green, violet, '#ec4899', '#06b6d4'];
-
-// Section 4: Revenue vs Expenditure
-new Chart(document.getElementById('revExpChart'), {{
-    type: 'bar',
-    data: {{
-        labels: {json.dumps(chart_labels)},
-        datasets: [
-            {{
-                label: 'Revenue YTD',
-                data: {json.dumps(chart_rev)},
-                backgroundColor: navy,
-                borderRadius: 4,
-            }},
-            {{
-                label: 'Expenditure YTD',
-                data: {json.dumps(chart_exp)},
-                backgroundColor: gold,
-                borderRadius: 4,
-            }}
-        ]
-    }},
-    options: {{
-        responsive: true,
-        plugins: {{
-            legend: {{ position: 'top' }},
-            tooltip: {{
-                callbacks: {{
-                    label: ctx => ctx.dataset.label + ': $' + ctx.raw.toLocaleString()
-                }}
-            }}
-        }},
-        scales: {{
-            x: {{ ticks: {{ maxRotation: 40, font: {{ size: 11 }} }} }},
-            y: {{ ticks: {{ callback: v => '$' + (v/1000000).toFixed(1) + 'M' }} }}
-        }}
-    }}
-}});
-
-// Section 6: Fund Donut
-new Chart(document.getElementById('fundDonut'), {{
-    type: 'doughnut',
-    data: {{
-        labels: {json.dumps(donut_labels)},
-        datasets: [{{
-            data: {json.dumps(donut_values)},
-            backgroundColor: palette.slice(0, {len(donut_labels)}),
-            borderWidth: 2,
-            borderColor: '#faf9f7'
-        }}]
-    }},
-    options: {{
-        responsive: true,
-        plugins: {{
-            legend: {{ position: 'right', labels: {{ font: {{ size: 11 }} }} }},
-            tooltip: {{
-                callbacks: {{
-                    label: ctx => ctx.label + ': $' + ctx.raw.toLocaleString()
-                }}
-            }}
-        }}
-    }}
-}});
-
-// Section 7: Function Stacked Bar
-new Chart(document.getElementById('funcChart'), {{
-    type: 'bar',
-    data: {{
-        labels: {json.dumps(func_labels)},
-        datasets: [
-            {{
-                label: 'YTD Actuals',
-                data: {json.dumps(func_actuals)},
-                backgroundColor: navy,
-                borderRadius: 2,
-            }},
-            {{
-                label: 'Encumbrance',
-                data: {json.dumps(func_enc)},
-                backgroundColor: amber,
-                borderRadius: 2,
-            }},
-            {{
-                label: 'Available',
-                data: {json.dumps(func_avail)},
-                backgroundColor: '#e8e4df',
-                borderRadius: 2,
-            }}
-        ]
-    }},
-    options: {{
-        indexAxis: 'y',
-        responsive: true,
-        plugins: {{
-            legend: {{ position: 'top' }},
-            tooltip: {{
-                callbacks: {{
-                    label: ctx => ctx.dataset.label + ': $' + ctx.raw.toLocaleString()
-                }}
-            }}
-        }},
-        scales: {{
-            x: {{
-                stacked: true,
-                ticks: {{ callback: v => '$' + (v/1000000).toFixed(1) + 'M' }}
-            }},
-            y: {{
-                stacked: true,
-                ticks: {{ font: {{ size: 11 }} }}
-            }}
-        }}
-    }}
-}});
-</script>
-</body>
-</html>"""
-
-    return html
-
-
-# ── Sidebar Filters ──────────────────────────────────────────────────────────
-fy_labels = {row["FiscalYearKey"]: row["FiscalYearLabel"] for _, row in DIM_FISCAL.iterrows()}
-
 with st.sidebar:
     st.markdown('<div class="app-title">OBMS Explorer</div>', unsafe_allow_html=True)
     st.markdown('<div class="app-subtitle">NM PED · School Budget Bureau</div>', unsafe_allow_html=True)
     st.markdown("---")
-
-    acct_type = st.radio(
-        "Account Type",
-        options=["E", "R"],
-        format_func=lambda x: "Expenditure" if x == "E" else "Revenue",
-        index=0,
-        horizontal=True
-    )
 
     fy_options = sorted(ALL_FY_KEYS, reverse=True)
     selected_fy = st.multiselect(
         "Fiscal Year",
         options=fy_options,
         default=[fy_options[0]] if fy_options else [],
-        format_func=lambda x: fy_labels.get(x, str(x))
+        format_func=lambda x: FY_LABELS.get(x, str(x))
     )
 
-# ── Data Loading ─────────────────────────────────────────────────────────────
 if not selected_fy:
     st.warning("Select at least one fiscal year.")
     st.stop()
@@ -1159,8 +612,8 @@ if len(act_raw) == 0 and len(bud_raw) == 0:
     st.error("No data loaded. Check that Google Drive files are publicly shared.")
     st.stop()
 
-# ── Remaining Sidebar Filters ────────────────────────────────────────────────
 with st.sidebar:
+    # Period selector
     available_periods = sorted(
         act_raw["Reporting Period"].unique()
     ) if len(act_raw) > 0 else []
@@ -1170,178 +623,226 @@ with st.sidebar:
             "Reporting Period",
             options=available_periods,
             index=len(available_periods) - 1,
-            help="Select the reporting quarter. YTD amounts are cumulative through this quarter."
+            help="YTD amounts are cumulative through this quarter."
         )
     else:
         selected_period = None
 
     st.markdown("---")
-    st.markdown('<div class="section-header">Dimension Filters</div>', unsafe_allow_html=True)
 
-    all_entities = sorted(
-        set(act_raw["Budget Entity"].unique()) | set(bud_raw["Budget Entity"].unique())
+    # Entity selector (global — applies to all tabs)
+    all_entities = sorted(get_unique_values(act_raw, bud_raw, "Budget Entity"))
+    selected_entity = st.selectbox(
+        "Budget Entity",
+        options=["— All Entities —"] + all_entities,
+        index=0,
+        help="Select a specific district or charter school, or view all."
     )
-    selected_entities = st.multiselect("Budget Entity", options=all_entities, default=[])
-
-    all_funds = sorted(
-        set(act_raw["Fund"].unique()) | set(bud_raw["Fund"].unique())
-    )
-    selected_funds = st.multiselect("Fund", options=all_funds, default=[])
-
-    all_functions = sorted(
-        set(act_raw["Function"].unique()) | set(bud_raw["Function"].unique())
-    )
-    selected_functions = st.multiselect("Function", options=all_functions, default=[])
-
-    all_objects = sorted(
-        set(act_raw["Object"].unique()) | set(bud_raw["Object"].unique())
-    )
-    selected_objects = st.multiselect("Object", options=all_objects, default=[])
-
-    all_programs = sorted(
-        set(act_raw["Program"].unique()) | set(bud_raw["Program"].unique())
-    )
-    selected_programs = st.multiselect("Program", options=all_programs, default=[])
 
     st.markdown("---")
     act_count = len(act_raw)
     bud_count = len(bud_raw)
-    st.caption(f"📁 {act_count:,} actuals rows · {bud_count:,} budget rows · {len(selected_fy)} fiscal year(s)")
-    st.caption(f"☁️ Data source: Google Drive")
+    st.caption(f"📁 {act_count:,} actuals · {bud_count:,} budget rows · {len(selected_fy)} FY(s)")
+    st.caption(f"☁️ Data source: Google Drive parquet files")
 
 
-# ── Apply Filters ────────────────────────────────────────────────────────────
-act_f, bud_f = apply_filters(
-    act_raw, bud_raw,
-    account_type=acct_type,
-    period=selected_period,
-    entities=selected_entities or None,
-    funds=selected_funds or None,
-    functions=selected_functions or None,
-    objects=selected_objects or None,
-    programs=selected_programs or None
-)
+# ── Apply global entity filter to raw data ───────────────────────────────────
+if selected_entity != "— All Entities —":
+    act_global = act_raw[act_raw["Budget Entity"] == selected_entity].copy()
+    bud_global = bud_raw[bud_raw["Budget Entity"] == selected_entity].copy()
+else:
+    act_global = act_raw.copy()
+    bud_global = bud_raw.copy()
+
+# Apply period filter to actuals
+if selected_period and len(act_global) > 0:
+    act_global = act_global[act_global["Reporting Period"] == selected_period]
+
+# Context labels
+fy_label = ", ".join(FY_LABELS.get(k, str(k)) for k in selected_fy)
+period_label = selected_period if selected_period else "All Periods"
+entity_label = selected_entity if selected_entity != "— All Entities —" else "All Entities"
+
+
+# ── Inline Tab Filter Helper ────────────────────────────────────────────────
+def render_tab_filters(tab_key: str, act_df: pd.DataFrame, bud_df: pd.DataFrame,
+                       dims: list[str] = None, show_acct_type: bool = False):
+    """
+    Render inline dimensional filters for a tab.
+    Returns (filtered_act, filtered_bud, account_type_selection).
+    """
+    if dims is None:
+        dims = FILTER_DIMS
+
+    filters = {}
+    acct_type = None
+
+    cols = st.columns(min(len(dims) + (1 if show_acct_type else 0), 4))
+    col_idx = 0
+
+    if show_acct_type:
+        with cols[col_idx % len(cols)]:
+            acct_type = st.radio(
+                "Account Type",
+                options=["E", "R"],
+                format_func=lambda x: "Expenditure" if x == "E" else "Revenue",
+                index=0,
+                horizontal=True,
+                key=f"{tab_key}_acct_type"
+            )
+        col_idx += 1
+
+    # If more dims than columns, use an expander
+    if len(dims) <= 3:
+        for dim in dims:
+            with cols[col_idx % len(cols)]:
+                vals = get_unique_values(act_df, bud_df, dim)
+                selected = st.multiselect(dim, options=vals, default=[], key=f"{tab_key}_{dim}")
+                if selected:
+                    filters[dim] = selected
+            col_idx += 1
+    else:
+        with st.expander("🔍 Dimension Filters", expanded=False):
+            fcols = st.columns(3)
+            for i, dim in enumerate(dims):
+                with fcols[i % 3]:
+                    vals = get_unique_values(act_df, bud_df, dim)
+                    selected = st.multiselect(dim, options=vals, default=[], key=f"{tab_key}_{dim}")
+                    if selected:
+                        filters[dim] = selected
+
+    a = apply_dim_filters(act_df, filters)
+    b = apply_dim_filters(bud_df, filters)
+
+    if acct_type:
+        if len(a) > 0 and "Account Type" in a.columns:
+            a = a[a["Account Type"] == acct_type]
+        if len(b) > 0 and "Account Type" in b.columns:
+            b = b[b["Account Type"] == acct_type]
+
+    return a, b, acct_type
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
-acct_label = "Expenditure" if acct_type == "E" else "Revenue"
-period_label = selected_period if selected_period else "All Periods"
-fy_label = ", ".join(fy_labels.get(k, str(k)) for k in selected_fy) if selected_fy else "All Years"
-
 st.markdown(f"""
 <div style="margin-bottom: 0.5rem;">
     <span class="app-title" style="font-size: 1.3rem;">OBMS Financial Explorer</span>
     <span style="color: var(--text-secondary); font-size: 0.85rem; margin-left: 12px;">
-        {acct_label} · {fy_label} · {period_label}
+        {entity_label} · {fy_label} · {period_label}
     </span>
 </div>
 """, unsafe_allow_html=True)
 
 
-# ── KPI Row ──────────────────────────────────────────────────────────────────
-total_budget = bud_f["Adjusted Amt"].sum()
-total_ytd = act_f["Actuals YTDAmount"].sum()
-total_encumbrance = act_f["Actuals Encumbrance"].sum()
-total_balance = total_budget - total_ytd - total_encumbrance
-total_pct_spent = (total_ytd / total_budget * 100) if total_budget != 0 else 0
-total_pct_committed = ((total_ytd + total_encumbrance) / total_budget * 100) if total_budget != 0 else 0
-total_fte_budget = bud_f["Final FTE"].sum()
-total_fte_actual = act_f["Actuals FTE"].sum()
-entity_count = max(bud_f["Budget Entity"].nunique(), act_f["Budget Entity"].nunique())
-
-k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("Adjusted Budget", fmt_currency(total_budget, compact=True))
-k2.metric("YTD Actuals", fmt_currency(total_ytd, compact=True))
-k3.metric("Encumbrance", fmt_currency(total_encumbrance, compact=True))
-k4.metric("Budget Balance", fmt_currency(total_balance, compact=True))
-k5.metric("% Spent (YTD)", fmt_pct(total_pct_spent))
-k6.metric("% Committed", fmt_pct(total_pct_committed))
-
-
 # ── Tabs ─────────────────────────────────────────────────────────────────────
-tab_overview, tab_entity, tab_detail, tab_trends, tab_report, tab_data = st.tabs([
-    "📊 Overview", "🏫 Entity Analysis", "🔍 Drill-Down", "📈 Trends",
-    "📄 District Report", "📋 Data Export"
+tab_overview, tab_budget, tab_actuals, tab_salary = st.tabs([
+    "📊 Overview", "📋 Budget Authority", "📈 Actuals", "👥 Salary & Benefits"
 ])
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 1: Overview
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1: OVERVIEW
+# ══════════════════════════════════════════════════════════════════════════════
 with tab_overview:
 
-    col_left, col_right = st.columns([3, 2])
+    # Revenue side totals
+    rev_bud = bud_global[bud_global["Account Type"] == "R"] if len(bud_global) > 0 else pd.DataFrame()
+    rev_act = act_global[act_global["Account Type"] == "R"] if len(act_global) > 0 else pd.DataFrame()
+    exp_bud = bud_global[bud_global["Account Type"] == "E"] if len(bud_global) > 0 else pd.DataFrame()
+    exp_act = act_global[act_global["Account Type"] == "E"] if len(act_global) > 0 else pd.DataFrame()
 
-    with col_left:
-        st.markdown('<div class="section-header">Budget vs Actuals by Fund</div>', unsafe_allow_html=True)
+    rev_budget_total = rev_bud["Adjusted Amt"].sum() if len(rev_bud) > 0 else 0
+    rev_ytd_total = rev_act["Actuals YTDAmount"].sum() if len(rev_act) > 0 else 0
+    exp_budget_total = exp_bud["Adjusted Amt"].sum() if len(exp_bud) > 0 else 0
+    exp_ytd_total = exp_act["Actuals YTDAmount"].sum() if len(exp_act) > 0 else 0
+    exp_enc_total = exp_act["Actuals Encumbrance"].sum() if len(exp_act) > 0 else 0
+    exp_balance = exp_budget_total - exp_ytd_total - exp_enc_total
+    net_ytd = rev_ytd_total - exp_ytd_total
 
-        bva_fund = compute_budget_vs_actuals(act_f, bud_f, "Fund")
-        top_funds = bva_fund.head(10).copy()
-        top_funds["Fund_Short"] = top_funds["Fund"].apply(extract_name)
+    # KPI Cards
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Revenue Budget", fmt_currency(rev_budget_total, compact=True))
+    k2.metric("Revenue YTD", fmt_currency(rev_ytd_total, compact=True))
+    k3.metric("Expenditure Budget", fmt_currency(exp_budget_total, compact=True))
+    k4.metric("Expenditure YTD", fmt_currency(exp_ytd_total, compact=True))
+    k5.metric("Encumbrance", fmt_currency(exp_enc_total, compact=True))
+    k6.metric("Net (Rev − Exp YTD)", fmt_currency(net_ytd, compact=True))
 
-        fig_fund = go.Figure()
-        fig_fund.add_trace(go.Bar(
-            name="Adjusted Budget",
-            x=top_funds["Fund_Short"],
-            y=top_funds["Adjusted_Budget"],
+    st.markdown("---")
+
+    # ── Revenue vs Expenditure by Fund ───────────────────────────────────
+    st.markdown('<div class="section-header">Revenue vs. Expenditure by Fund</div>', unsafe_allow_html=True)
+
+    rev_by_fund = rev_act.groupby("Fund").agg(
+        Revenue_YTD=("Actuals YTDAmount", "sum")
+    ).reset_index() if len(rev_act) > 0 else pd.DataFrame(columns=["Fund", "Revenue_YTD"])
+
+    exp_by_fund = exp_act.groupby("Fund").agg(
+        Expenditure_YTD=("Actuals YTDAmount", "sum")
+    ).reset_index() if len(exp_act) > 0 else pd.DataFrame(columns=["Fund", "Expenditure_YTD"])
+
+    fund_merged = rev_by_fund.merge(exp_by_fund, on="Fund", how="outer").fillna(0)
+    fund_merged["Net"] = fund_merged["Revenue_YTD"] - fund_merged["Expenditure_YTD"]
+    fund_merged["Total_Activity"] = fund_merged["Revenue_YTD"].abs() + fund_merged["Expenditure_YTD"].abs()
+    fund_merged["Fund_Name"] = fund_merged["Fund"].apply(extract_name)
+    fund_merged["Fund_Class"] = fund_merged["Fund"].apply(classify_fund)
+    fund_merged = fund_merged.sort_values("Total_Activity", ascending=False)
+
+    if len(fund_merged) > 0:
+        top_chart = fund_merged.head(12)
+        fig_revexp = go.Figure()
+        fig_revexp.add_trace(go.Bar(
+            name="Revenue YTD", x=top_chart["Fund_Name"], y=top_chart["Revenue_YTD"],
             marker_color="#4f8df5",
-            hovertemplate="%{x}<br>Budget: $%{y:,.0f}<extra></extra>"
+            hovertemplate="%{x}<br>Revenue: $%{y:,.0f}<extra></extra>"
         ))
-        fig_fund.add_trace(go.Bar(
-            name="YTD Actuals",
-            x=top_funds["Fund_Short"],
-            y=top_funds["YTD_Actuals"],
-            marker_color="#2dd4bf",
-            hovertemplate="%{x}<br>YTD: $%{y:,.0f}<extra></extra>"
-        ))
-        fig_fund.add_trace(go.Bar(
-            name="Encumbrance",
-            x=top_funds["Fund_Short"],
-            y=top_funds["Encumbrance"],
+        fig_revexp.add_trace(go.Bar(
+            name="Expenditure YTD", x=top_chart["Fund_Name"], y=top_chart["Expenditure_YTD"],
             marker_color="#f59e0b",
-            opacity=0.7,
-            hovertemplate="%{x}<br>Encumbrance: $%{y:,.0f}<extra></extra>"
+            hovertemplate="%{x}<br>Expenditure: $%{y:,.0f}<extra></extra>"
         ))
-        fig_fund.update_layout(
-            **PLOTLY_TEMPLATE["layout"].to_plotly_json(),
-            barmode="group",
-            height=420,
+        fig_revexp.update_layout(
+            **plotly_layout(barmode="group", height=400,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            xaxis_tickangle=-30,
-            yaxis_title=""
+            xaxis_tickangle=-30, yaxis_title="")
         )
-        st.plotly_chart(fig_fund, use_container_width=True)
+        st.plotly_chart(fig_revexp, use_container_width=True)
 
-    with col_right:
-        st.markdown('<div class="section-header">Spend Distribution by Function</div>', unsafe_allow_html=True)
+    # ── Funds where expenditures exceed revenue ──────────────────────────
+    deficit_funds = fund_merged[fund_merged["Net"] < 0].copy()
+    deficit_funds["Deficit"] = deficit_funds["Net"].abs()
 
-        bva_func = compute_budget_vs_actuals(act_f, bud_f, "Function")
-        bva_func["Function_Name"] = bva_func["Function"].apply(extract_name)
-        bva_func_top = bva_func[bva_func["YTD_Actuals"] > 0].head(8)
+    if len(deficit_funds) > 0:
+        st.markdown('<div class="section-header">Funds: Expenditures Exceed Revenue</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
 
-        fig_func = go.Figure(go.Treemap(
-            labels=bva_func_top["Function_Name"],
-            values=bva_func_top["YTD_Actuals"],
-            parents=[""] * len(bva_func_top),
-            textinfo="label+value+percent root",
-            texttemplate="%{label}<br>$%{value:,.0f}<br>%{percentRoot:.1%}",
-            marker=dict(
-                colors=bva_func_top["Pct_Spent"],
-                colorscale=[[0, "#2dd4bf"], [0.5, "#4f8df5"], [1, "#f43f5e"]],
-                showscale=True,
-                colorbar=dict(title="% Spent", ticksuffix="%")
-            ),
-            hovertemplate="%{label}<br>YTD: $%{value:,.0f}<br>% Spent: %{color:.1f}%<extra></extra>"
-        ))
-        tmpl = PLOTLY_TEMPLATE["layout"].to_plotly_json()
-        tmpl["margin"] = dict(l=10, r=10, t=30, b=10)
-        fig_func.update_layout(**tmpl, height=420)
-        st.plotly_chart(fig_func, use_container_width=True)
+        non_reimb = deficit_funds[deficit_funds["Fund_Class"] == "Non-Reimbursable"]
+        reimb = deficit_funds[deficit_funds["Fund_Class"] == "Reimbursable"]
 
-    # ── Execution gauge ──
-    st.markdown('<div class="section-header">Budget Execution Summary</div>', unsafe_allow_html=True)
+        with c1:
+            st.markdown("**Non-Reimbursable** _(cash concern)_")
+            if len(non_reimb) > 0:
+                nr = non_reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
+                nr.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
+                st.dataframe(nr.style.format({
+                    "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
+                }), use_container_width=True, height=min(300, len(non_reimb) * 40 + 60))
+            else:
+                st.success("No non-reimbursable fund deficits.")
 
-    g1, g2, g3 = st.columns(3)
+        with c2:
+            st.markdown("**Reimbursable** _(expected: spend first, reimburse later)_")
+            if len(reimb) > 0:
+                r = reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
+                r.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
+                st.dataframe(r.style.format({
+                    "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
+                }), use_container_width=True, height=min(300, len(reimb) * 40 + 60))
+            else:
+                st.info("No reimbursable fund deficits.")
+
+    # ── Budget Execution Gauges ──────────────────────────────────────────
+    st.markdown('<div class="section-header">Budget Execution</div>', unsafe_allow_html=True)
 
     if selected_period and selected_period.startswith("Q"):
         quarter_num = int(selected_period[1:])
@@ -1349,792 +850,853 @@ with tab_overview:
     else:
         expected_pct = 50
 
+    exp_pct_spent = (exp_ytd_total / exp_budget_total * 100) if exp_budget_total else 0
+    exp_pct_committed = ((exp_ytd_total + exp_enc_total) / exp_budget_total * 100) if exp_budget_total else 0
+    rev_pct_collected = (rev_ytd_total / rev_budget_total * 100) if rev_budget_total else 0
+
+    g1, g2, g3 = st.columns(3)
+
     with g1:
-        fig_gauge1 = go.Figure(go.Indicator(
+        fig_g = go.Figure(go.Indicator(
             mode="gauge+number+delta",
-            value=total_pct_spent,
+            value=exp_pct_spent,
             number={"suffix": "%", "font": {"size": 36, "family": "JetBrains Mono"}},
             delta={"reference": expected_pct, "suffix": "%", "relative": False},
-            title={"text": "% Spent vs Expected", "font": {"size": 14}},
+            title={"text": "Exp. % Spent vs Expected", "font": {"size": 14}},
             gauge={
                 "axis": {"range": [0, 100], "ticksuffix": "%"},
-                "bar": {"color": "#4f8df5"},
-                "bgcolor": "#1a1d2e",
-                "steps": [
-                    {"range": [0, expected_pct], "color": "#1e2130"},
-                    {"range": [expected_pct, 100], "color": "#1a1a2e"}
-                ],
-                "threshold": {
-                    "line": {"color": "#f59e0b", "width": 3},
-                    "thickness": 0.8,
-                    "value": expected_pct
-                }
+                "bar": {"color": "#4f8df5"}, "bgcolor": "#1a1d2e",
+                "steps": [{"range": [0, expected_pct], "color": "#1e2130"},
+                          {"range": [expected_pct, 100], "color": "#1a1a2e"}],
+                "threshold": {"line": {"color": "#f59e0b", "width": 3},
+                              "thickness": 0.8, "value": expected_pct}
             }
         ))
-        tmpl1 = PLOTLY_TEMPLATE["layout"].to_plotly_json()
-        tmpl1["margin"] = dict(l=30, r=30, t=60, b=20)
-        fig_gauge1.update_layout(**tmpl1, height=250)
-        st.plotly_chart(fig_gauge1, use_container_width=True)
+        fig_g.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
+        st.plotly_chart(fig_g, use_container_width=True)
 
     with g2:
-        fig_gauge2 = go.Figure(go.Indicator(
+        fig_g2 = go.Figure(go.Indicator(
             mode="gauge+number",
-            value=total_pct_committed,
+            value=exp_pct_committed,
             number={"suffix": "%", "font": {"size": 36, "family": "JetBrains Mono"}},
-            title={"text": "% Committed (YTD + Enc.)", "font": {"size": 14}},
+            title={"text": "Exp. % Committed (YTD + Enc)", "font": {"size": 14}},
             gauge={
                 "axis": {"range": [0, 120], "ticksuffix": "%"},
-                "bar": {"color": "#2dd4bf"},
-                "bgcolor": "#1a1d2e",
-                "steps": [
-                    {"range": [0, 100], "color": "#1e2130"},
-                    {"range": [100, 120], "color": "#3d1515"}
-                ],
-                "threshold": {
-                    "line": {"color": "#f43f5e", "width": 3},
-                    "thickness": 0.8,
-                    "value": 100
-                }
+                "bar": {"color": "#2dd4bf"}, "bgcolor": "#1a1d2e",
+                "steps": [{"range": [0, 100], "color": "#1e2130"},
+                          {"range": [100, 120], "color": "#3d1515"}],
+                "threshold": {"line": {"color": "#f43f5e", "width": 3},
+                              "thickness": 0.8, "value": 100}
             }
         ))
-        tmpl2 = PLOTLY_TEMPLATE["layout"].to_plotly_json()
-        tmpl2["margin"] = dict(l=30, r=30, t=60, b=20)
-        fig_gauge2.update_layout(**tmpl2, height=250)
-        st.plotly_chart(fig_gauge2, use_container_width=True)
+        fig_g2.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
+        st.plotly_chart(fig_g2, use_container_width=True)
 
     with g3:
-        fig_gauge3 = go.Figure(go.Indicator(
-            mode="number+delta",
-            value=total_balance,
-            number={"prefix": "$", "font": {"size": 36, "family": "JetBrains Mono"},
-                    "valueformat": ",.0f"},
-            title={"text": "Remaining Balance", "font": {"size": 14}},
-            delta={"reference": total_budget * 0.5, "prefix": "$", "valueformat": ",.0f",
-                   "relative": False}
+        fig_g3 = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=rev_pct_collected,
+            number={"suffix": "%", "font": {"size": 36, "family": "JetBrains Mono"}},
+            delta={"reference": expected_pct, "suffix": "%", "relative": False},
+            title={"text": "Revenue % Collected vs Expected", "font": {"size": 14}},
+            gauge={
+                "axis": {"range": [0, 120], "ticksuffix": "%"},
+                "bar": {"color": "#84cc16"}, "bgcolor": "#1a1d2e",
+                "steps": [{"range": [0, expected_pct], "color": "#1e2130"},
+                          {"range": [expected_pct, 120], "color": "#1a1a2e"}],
+                "threshold": {"line": {"color": "#f59e0b", "width": 3},
+                              "thickness": 0.8, "value": expected_pct}
+            }
         ))
-        tmpl3 = PLOTLY_TEMPLATE["layout"].to_plotly_json()
-        tmpl3["margin"] = dict(l=30, r=30, t=60, b=20)
-        fig_gauge3.update_layout(**tmpl3, height=250)
-        st.plotly_chart(fig_gauge3, use_container_width=True)
+        fig_g3.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
+        st.plotly_chart(fig_g3, use_container_width=True)
 
+    # ── Expenditure by Function (treemap) ────────────────────────────────
+    st.markdown('<div class="section-header">Expenditure by Function</div>', unsafe_allow_html=True)
 
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 2: Entity Analysis
-# ════════════════════════════════════════════════════════════════════════════
-with tab_entity:
+    if len(exp_act) > 0:
+        func_exp = exp_act.groupby("Function").agg(
+            YTD=("Actuals YTDAmount", "sum")
+        ).reset_index()
+        func_exp["Name"] = func_exp["Function"].apply(extract_name)
+        func_exp = func_exp[func_exp["YTD"] > 0].sort_values("YTD", ascending=False)
 
-    bva_entity = compute_budget_vs_actuals(act_f, bud_f, "Budget Entity")
+        func_bud_agg = exp_bud.groupby("Function").agg(
+            Budget=("Adjusted Amt", "sum")
+        ).reset_index() if len(exp_bud) > 0 else pd.DataFrame(columns=["Function", "Budget"])
 
-    st.markdown('<div class="section-header">Entity Budget Execution</div>', unsafe_allow_html=True)
+        func_merged = func_exp.merge(func_bud_agg, on="Function", how="left").fillna(0)
+        func_merged["Pct_Spent"] = (func_merged["YTD"] / func_merged["Budget"].replace(0, np.nan) * 100)
 
-    scatter_data = bva_entity[bva_entity["Adjusted_Budget"] > 0].copy()
-
-    fig_scatter = px.scatter(
-        scatter_data,
-        x="Adjusted_Budget",
-        y="Pct_Spent",
-        size="YTD_Actuals",
-        color="Pct_Committed",
-        color_continuous_scale=[[0, "#2dd4bf"], [0.5, "#4f8df5"], [1, "#f43f5e"]],
-        hover_name="Budget Entity",
-        hover_data={
-            "Adjusted_Budget": ":$,.0f",
-            "YTD_Actuals": ":$,.0f",
-            "Pct_Spent": ":.1f",
-            "Pct_Committed": ":.1f"
-        },
-        labels={
-            "Adjusted_Budget": "Adjusted Budget",
-            "Pct_Spent": "% Spent (YTD)",
-            "Pct_Committed": "% Committed"
-        }
-    )
-    fig_scatter.update_layout(
-        **PLOTLY_TEMPLATE["layout"].to_plotly_json(),
-        height=450,
-        xaxis_title="Adjusted Budget",
-        yaxis_title="% Spent (YTD)",
-        coloraxis_colorbar_title="% Committed"
-    )
-    if selected_period and selected_period.startswith("Q"):
-        quarter_num = int(selected_period[1:])
-        fig_scatter.add_hline(y=quarter_num * 25, line_dash="dash",
-                              line_color="#f59e0b", opacity=0.6,
-                              annotation_text=f"Expected ({quarter_num*25}%)")
-    st.plotly_chart(fig_scatter, use_container_width=True)
-
-    st.markdown('<div class="section-header">Entity Detail Table</div>', unsafe_allow_html=True)
-
-    display_entity = bva_entity[["Budget Entity", "Adjusted_Budget", "YTD_Actuals",
-                                  "Encumbrance", "Budget_Balance", "Pct_Spent",
-                                  "Pct_Committed", "Budget_FTE", "Actuals_FTE"]].copy()
-    display_entity.columns = ["Entity", "Adjusted Budget", "YTD Actuals",
-                               "Encumbrance", "Balance", "% Spent",
-                               "% Committed", "Budget FTE", "Actual FTE"]
-
-    st.dataframe(
-        display_entity.style.format({
-            "Adjusted Budget": "${:,.0f}",
-            "YTD Actuals": "${:,.0f}",
-            "Encumbrance": "${:,.0f}",
-            "Balance": "${:,.0f}",
-            "% Spent": "{:.1f}%",
-            "% Committed": "{:.1f}%",
-            "Budget FTE": "{:,.1f}",
-            "Actual FTE": "{:,.1f}"
-        }),
-        use_container_width=True,
-        height=500
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 3: Drill-Down
-# ════════════════════════════════════════════════════════════════════════════
-with tab_detail:
-
-    st.markdown('<div class="section-header">Dimensional Drill-Down</div>', unsafe_allow_html=True)
-
-    drill_dim = st.selectbox(
-        "Group by",
-        options=["Fund", "Function", "Object", "Program", "Job Class", "Location"],
-        index=0
-    )
-
-    col_map = {
-        "Fund": "Fund",
-        "Function": "Function",
-        "Object": "Object",
-        "Program": "Program",
-        "Job Class": "Job Class",
-        "Location": "Location"
-    }
-    drill_col = col_map[drill_dim]
-
-    bva_drill = compute_budget_vs_actuals(act_f, bud_f, drill_col)
-    bva_drill["Short_Name"] = bva_drill[drill_col].apply(extract_name)
-    bva_drill["Code"] = bva_drill[drill_col].apply(extract_code)
-
-    top_n = st.slider("Show top N", min_value=5, max_value=50, value=15)
-    drill_top = bva_drill.head(top_n)
-
-    fig_drill = go.Figure()
-    fig_drill.add_trace(go.Bar(
-        name="YTD Actuals",
-        y=drill_top["Short_Name"],
-        x=drill_top["YTD_Actuals"],
-        orientation="h",
-        marker_color="#4f8df5",
-        hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
-    ))
-    fig_drill.add_trace(go.Bar(
-        name="Encumbrance",
-        y=drill_top["Short_Name"],
-        x=drill_top["Encumbrance"],
-        orientation="h",
-        marker_color="#f59e0b",
-        opacity=0.7,
-        hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
-    ))
-    fig_drill.add_trace(go.Bar(
-        name="Remaining Balance",
-        y=drill_top["Short_Name"],
-        x=drill_top["Budget_Balance"].clip(lower=0),
-        orientation="h",
-        marker_color="#1e2130",
-        marker_line=dict(color="#4f8df5", width=1),
-        hovertemplate="%{y}<br>Balance: $%{x:,.0f}<extra></extra>"
-    ))
-    tmpl_drill = PLOTLY_TEMPLATE["layout"].to_plotly_json()
-    tmpl_drill["yaxis"] = dict(autorange="reversed", gridcolor="#1e2130", zerolinecolor="#2a2d3e")
-    fig_drill.update_layout(
-        **tmpl_drill,
-        barmode="stack",
-        height=max(350, top_n * 28),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis_title=""
-    )
-    st.plotly_chart(fig_drill, use_container_width=True)
-
-    drill_display = bva_drill[[drill_col, "Adjusted_Budget", "YTD_Actuals",
-                                "Encumbrance", "Budget_Balance", "Pct_Spent"]].copy()
-    drill_display.columns = [drill_dim, "Adjusted Budget", "YTD Actuals",
-                              "Encumbrance", "Balance", "% Spent"]
-    st.dataframe(
-        drill_display.style.format({
-            "Adjusted Budget": "${:,.0f}",
-            "YTD Actuals": "${:,.0f}",
-            "Encumbrance": "${:,.0f}",
-            "Balance": "${:,.0f}",
-            "% Spent": "{:.1f}%"
-        }),
-        use_container_width=True,
-        height=400
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 4: Trends (Multi-Period)
-# ════════════════════════════════════════════════════════════════════════════
-with tab_trends:
-
-    st.markdown('<div class="section-header">Quarter-over-Quarter Trends</div>', unsafe_allow_html=True)
-
-    act_trends = act_raw
-    if acct_type:
-        act_trends = act_trends[act_trends["Account Type"] == acct_type]
-    if selected_entities:
-        act_trends = act_trends[act_trends["Budget Entity"].isin(selected_entities)]
-    if selected_funds:
-        act_trends = act_trends[act_trends["Fund"].isin(selected_funds)]
-
-    trend_data = act_trends.groupby(["Reporting Period", "PeriodOrder", "FiscalYearKey"]).agg(
-        Period_Amount=("Actuals Period Amount", "sum"),
-        YTD_Amount=("Actuals YTDAmount", "sum"),
-        Encumbrance=("Actuals Encumbrance", "sum"),
-        FTE=("Actuals FTE", "sum")
-    ).reset_index().sort_values(["FiscalYearKey", "PeriodOrder"])
-
-    trend_data["FY_Label"] = trend_data["FiscalYearKey"].map(fy_labels)
-
-    if len(trend_data) > 0:
-        tc1, tc2 = st.columns(2)
-
-        with tc1:
-            fig_trend1 = go.Figure()
-            for fy in trend_data["FiscalYearKey"].unique():
-                fy_data = trend_data[trend_data["FiscalYearKey"] == fy]
-                fig_trend1.add_trace(go.Scatter(
-                    x=fy_data["Reporting Period"],
-                    y=fy_data["YTD_Amount"],
-                    mode="lines+markers",
-                    name=fy_labels.get(fy, str(fy)),
-                    line=dict(width=3),
-                    marker=dict(size=10),
-                    hovertemplate="%{x}<br>YTD: $%{y:,.0f}<extra></extra>"
-                ))
-            fig_trend1.update_layout(
-                **PLOTLY_TEMPLATE["layout"].to_plotly_json(),
-                title="YTD Cumulative Spend",
-                height=380,
-                yaxis_title=""
-            )
-            st.plotly_chart(fig_trend1, use_container_width=True)
-
-        with tc2:
-            fig_trend2 = go.Figure()
-            for fy in trend_data["FiscalYearKey"].unique():
-                fy_data = trend_data[trend_data["FiscalYearKey"] == fy]
-                fig_trend2.add_trace(go.Bar(
-                    x=fy_data["Reporting Period"],
-                    y=fy_data["Period_Amount"],
-                    name=fy_labels.get(fy, str(fy)),
-                    hovertemplate="%{x}<br>Period: $%{y:,.0f}<extra></extra>"
-                ))
-            fig_trend2.update_layout(
-                **PLOTLY_TEMPLATE["layout"].to_plotly_json(),
-                title="Period Spend by Quarter",
-                height=380,
-                barmode="group",
-                yaxis_title=""
-            )
-            st.plotly_chart(fig_trend2, use_container_width=True)
-
-        st.markdown('<div class="section-header">FTE Trends</div>', unsafe_allow_html=True)
-        fig_fte = go.Figure()
-        for fy in trend_data["FiscalYearKey"].unique():
-            fy_data = trend_data[trend_data["FiscalYearKey"] == fy]
-            fig_fte.add_trace(go.Scatter(
-                x=fy_data["Reporting Period"],
-                y=fy_data["FTE"],
-                mode="lines+markers",
-                name=fy_labels.get(fy, str(fy)),
-                line=dict(width=3),
-                marker=dict(size=10),
-                fill="tozeroy",
-                hovertemplate="%{x}<br>FTE: %{y:,.1f}<extra></extra>"
+        if len(func_merged) > 0:
+            fig_tree = go.Figure(go.Treemap(
+                labels=func_merged["Name"].head(12),
+                values=func_merged["YTD"].head(12),
+                parents=[""] * min(12, len(func_merged)),
+                textinfo="label+value+percent root",
+                texttemplate="%{label}<br>$%{value:,.0f}<br>%{percentRoot:.1%}",
+                marker=dict(
+                    colors=func_merged["Pct_Spent"].head(12).fillna(0),
+                    colorscale=[[0, "#2dd4bf"], [0.5, "#4f8df5"], [1, "#f43f5e"]],
+                    showscale=True,
+                    colorbar=dict(title="% Spent", ticksuffix="%")
+                ),
+                hovertemplate="%{label}<br>YTD: $%{value:,.0f}<br>% Spent: %{color:.1f}%<extra></extra>"
             ))
-        fig_fte.update_layout(
-            **PLOTLY_TEMPLATE["layout"].to_plotly_json(),
-            title="FTE by Quarter",
-            height=350,
-            yaxis_title="FTE"
-        )
-        st.plotly_chart(fig_fte, use_container_width=True)
-    else:
-        st.info("No trend data available for current filters.")
+            fig_tree.update_layout(**plotly_layout(height=420, margin=dict(l=10, r=10, t=30, b=10)))
+            st.plotly_chart(fig_tree, use_container_width=True)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 5: District Report + Entity Analysis (Sections 4–7)
-# ════════════════════════════════════════════════════════════════════════════
-with tab_report:
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2: BUDGET AUTHORITY
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_budget:
 
-    st.markdown('<div class="section-header">Quarterly District Report</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">Budget Authority Analysis</div>', unsafe_allow_html=True)
+
+    bud_act_f, bud_bud_f, bud_acct_type = render_tab_filters(
+        "budget", act_global, bud_global, dims=FILTER_DIMS, show_acct_type=True
+    )
+    bud_acct_label = "Expenditure" if bud_acct_type == "E" else "Revenue"
+
+    # ── Summary KPIs ─────────────────────────────────────────────────────
+    beg_total = bud_bud_f["Final Amt"].sum() if len(bud_bud_f) > 0 else 0
+    adj_amt_total = bud_bud_f["Adjustment Amt"].sum() if len(bud_bud_f) > 0 else 0
+    adj_bud_total = bud_bud_f["Adjusted Amt"].sum() if len(bud_bud_f) > 0 else 0
+    beg_fte_total = bud_bud_f["Final FTE"].sum() if len(bud_bud_f) > 0 else 0
+    adj_fte_total = bud_bud_f["Adjusted FTE"].sum() if len(bud_bud_f) > 0 else 0
+
+    bk1, bk2, bk3, bk4, bk5 = st.columns(5)
+    bk1.metric("Beginning Budget", fmt_currency(beg_total, compact=True))
+    bk2.metric("BAR Adjustments", fmt_currency(adj_amt_total, compact=True))
+    bk3.metric("Adjusted Budget", fmt_currency(adj_bud_total, compact=True))
+    bk4.metric("Beginning FTE", f"{beg_fte_total:,.1f}")
+    bk5.metric("Adjusted FTE", f"{adj_fte_total:,.1f}")
+
+    st.markdown("---")
+
+    # ── Revenue Budget vs Expenditure Budget ─────────────────────────────
+    st.markdown("#### Revenue Budget vs. Expenditure Budget")
     st.caption(
-        "Generate expenditure and revenue reports in the standard quarterly review "
-        "CSV format, plus an interactive financial analysis with HTML export."
+        "Revenue and expenditure budgets must balance. This shows where approved "
+        "budget authority is allocated across revenue sources and expenditure categories."
     )
 
-    # ── Entity selector (independent of sidebar entity filter) ───────────
-    report_entities = sorted(
-        set(act_raw["Budget Entity"].unique()) | set(bud_raw["Budget Entity"].unique())
+    rev_bud_tab = bud_global[bud_global["Account Type"] == "R"] if len(bud_global) > 0 else pd.DataFrame()
+    exp_bud_tab = bud_global[bud_global["Account Type"] == "E"] if len(bud_global) > 0 else pd.DataFrame()
+
+    rb1, rb2 = st.columns(2)
+
+    with rb1:
+        st.markdown("**Revenue Budget by Fund**")
+        if len(rev_bud_tab) > 0:
+            rev_by_fund_bud = rev_bud_tab.groupby("Fund").agg(
+                Beginning=("Final Amt", "sum"),
+                Adjustments=("Adjustment Amt", "sum"),
+                Adjusted=("Adjusted Amt", "sum"),
+            ).reset_index().sort_values("Adjusted", ascending=False)
+            rev_by_fund_bud["Fund_Name"] = rev_by_fund_bud["Fund"].apply(extract_name)
+
+            fig_rev_bud = go.Figure()
+            fig_rev_bud.add_trace(go.Bar(
+                name="Beginning", y=rev_by_fund_bud["Fund_Name"].head(10),
+                x=rev_by_fund_bud["Beginning"].head(10),
+                orientation="h", marker_color="#4f8df5",
+                hovertemplate="%{y}<br>Beginning: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_rev_bud.add_trace(go.Bar(
+                name="BAR Adjustments", y=rev_by_fund_bud["Fund_Name"].head(10),
+                x=rev_by_fund_bud["Adjustments"].head(10),
+                orientation="h", marker_color="#2dd4bf",
+                hovertemplate="%{y}<br>Adjustments: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_rev_bud.update_layout(
+                **plotly_layout(barmode="stack", height=350,
+                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
+            )
+            st.plotly_chart(fig_rev_bud, use_container_width=True)
+        else:
+            st.info("No revenue budget data.")
+
+    with rb2:
+        st.markdown("**Expenditure Budget by Function**")
+        if len(exp_bud_tab) > 0:
+            exp_by_func_bud = exp_bud_tab.groupby("Function").agg(
+                Beginning=("Final Amt", "sum"),
+                Adjustments=("Adjustment Amt", "sum"),
+                Adjusted=("Adjusted Amt", "sum"),
+            ).reset_index().sort_values("Adjusted", ascending=False)
+            exp_by_func_bud["Func_Name"] = exp_by_func_bud["Function"].apply(extract_name)
+
+            fig_exp_bud = go.Figure()
+            fig_exp_bud.add_trace(go.Bar(
+                name="Beginning", y=exp_by_func_bud["Func_Name"].head(10),
+                x=exp_by_func_bud["Beginning"].head(10),
+                orientation="h", marker_color="#f59e0b",
+                hovertemplate="%{y}<br>Beginning: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_exp_bud.add_trace(go.Bar(
+                name="BAR Adjustments", y=exp_by_func_bud["Func_Name"].head(10),
+                x=exp_by_func_bud["Adjustments"].head(10),
+                orientation="h", marker_color="#f43f5e",
+                hovertemplate="%{y}<br>Adjustments: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_exp_bud.update_layout(
+                **plotly_layout(barmode="stack", height=350,
+                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
+            )
+            st.plotly_chart(fig_exp_bud, use_container_width=True)
+        else:
+            st.info("No expenditure budget data.")
+
+    # ── BAR Analysis: Where are adjustments happening? ───────────────────
+    st.markdown("---")
+    st.markdown("#### BAR Adjustment Analysis")
+    st.caption("Identifies where budget adjustments (BARs) have shifted funding.")
+
+    if len(bud_bud_f) > 0:
+        # Only show lines with non-zero adjustments
+        bars_data = bud_bud_f[bud_bud_f["Adjustment Amt"] != 0].copy()
+
+        if len(bars_data) > 0:
+            bar_by_fund = bars_data.groupby("Fund").agg(
+                Increases=("Adjustment Amt", lambda x: x[x > 0].sum()),
+                Decreases=("Adjustment Amt", lambda x: x[x < 0].sum()),
+                Net_Adjustment=("Adjustment Amt", "sum"),
+            ).reset_index()
+            bar_by_fund["Fund_Name"] = bar_by_fund["Fund"].apply(extract_name)
+            bar_by_fund = bar_by_fund.sort_values("Net_Adjustment", key=abs, ascending=False)
+
+            # Waterfall-style chart
+            fig_bar = go.Figure()
+            fig_bar.add_trace(go.Bar(
+                name="Increases",
+                y=bar_by_fund["Fund_Name"].head(12),
+                x=bar_by_fund["Increases"].head(12),
+                orientation="h", marker_color="#2dd4bf",
+                hovertemplate="%{y}<br>Increases: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_bar.add_trace(go.Bar(
+                name="Decreases",
+                y=bar_by_fund["Fund_Name"].head(12),
+                x=bar_by_fund["Decreases"].head(12),
+                orientation="h", marker_color="#f43f5e",
+                hovertemplate="%{y}<br>Decreases: $%{x:,.0f}<extra></extra>"
+            ))
+            fig_bar.update_layout(
+                **plotly_layout(barmode="relative", height=max(300, min(12, len(bar_by_fund)) * 32),
+                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                title=f"{bud_acct_label} BAR Adjustments by Fund")
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+            # Detail table
+            bar_detail = bars_data.groupby(["Fund", "Function"]).agg(
+                Beginning=("Final Amt", "sum"),
+                Adjustment=("Adjustment Amt", "sum"),
+                Adjusted=("Adjusted Amt", "sum"),
+                FTE_Adj=("Adjustment FTE", "sum"),
+            ).reset_index().sort_values("Adjustment", key=abs, ascending=False)
+
+            st.dataframe(
+                bar_detail.style.format({
+                    "Beginning": "${:,.0f}", "Adjustment": "${:,.0f}",
+                    "Adjusted": "${:,.0f}", "FTE_Adj": "{:,.2f}"
+                }).map(
+                    lambda v: "color: #2dd4bf" if isinstance(v, (int, float)) and v > 0
+                    else ("color: #f43f5e" if isinstance(v, (int, float)) and v < 0 else ""),
+                    subset=["Adjustment"]
+                ),
+                use_container_width=True, height=min(500, len(bar_detail) * 35 + 60)
+            )
+        else:
+            st.info("No BAR adjustments found for current filters.")
+
+    # ── Budget vs Actuals Comparison (exceeding budget authority) ─────────
+    st.markdown("---")
+    st.markdown("#### Budget Authority vs. Actuals")
+    st.caption(
+        "NMAC requires budget authority at the function level. This view checks "
+        "for expenditures exceeding budget authority, with optional drill-down to object."
     )
 
-    report_entity = st.selectbox(
-        "Select District / Charter School",
-        options=report_entities,
-        index=0,
-        key="report_entity_select"
+    if len(bud_bud_f) > 0 and len(bud_act_f) > 0:
+        bva_group = st.radio(
+            "Group by", options=["Function", "Object", "Fund"],
+            index=0, horizontal=True, key="bva_group"
+        )
+
+        b_agg = bud_bud_f.groupby(bva_group).agg(
+            Adjusted_Budget=("Adjusted Amt", "sum"),
+            Budget_FTE=("Adjusted FTE", "sum"),
+        ).reset_index()
+
+        a_agg = bud_act_f.groupby(bva_group).agg(
+            YTD_Actuals=("Actuals YTDAmount", "sum"),
+            Encumbrance=("Actuals Encumbrance", "sum"),
+            Actuals_FTE=("Actuals FTE", "sum"),
+        ).reset_index()
+
+        bva = b_agg.merge(a_agg, on=bva_group, how="outer").fillna(0)
+        bva["Available"] = bva["Adjusted_Budget"] - bva["YTD_Actuals"] - bva["Encumbrance"]
+        bva["Pct_Used"] = ((bva["YTD_Actuals"] + bva["Encumbrance"]) /
+                           bva["Adjusted_Budget"].replace(0, np.nan) * 100)
+        bva["Name"] = bva[bva_group].apply(extract_name)
+        bva = bva.sort_values("Adjusted_Budget", ascending=False)
+
+        # Flag lines exceeding budget authority
+        exceeding = bva[bva["Available"] < 0]
+        if len(exceeding) > 0:
+            st.warning(f"⚠️ {len(exceeding)} {bva_group.lower()}(s) have expenditures + encumbrances exceeding budget authority.")
+
+        # Stacked horizontal bar
+        top_bva = bva[bva["Adjusted_Budget"] > 0].head(15)
+        fig_bva = go.Figure()
+        fig_bva.add_trace(go.Bar(
+            name="YTD Actuals", y=top_bva["Name"], x=top_bva["YTD_Actuals"],
+            orientation="h", marker_color="#4f8df5",
+            hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
+        ))
+        fig_bva.add_trace(go.Bar(
+            name="Encumbrance", y=top_bva["Name"], x=top_bva["Encumbrance"],
+            orientation="h", marker_color="#f59e0b",
+            hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
+        ))
+        fig_bva.add_trace(go.Bar(
+            name="Available", y=top_bva["Name"], x=top_bva["Available"].clip(lower=0),
+            orientation="h", marker_color="#1e2130", marker_line=dict(color="#4f8df5", width=1),
+            hovertemplate="%{y}<br>Available: $%{x:,.0f}<extra></extra>"
+        ))
+        fig_bva.update_layout(
+            **plotly_layout(barmode="stack", height=max(300, len(top_bva) * 30),
+            yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
+        )
+        st.plotly_chart(fig_bva, use_container_width=True)
+
+        # Full table
+        bva_display = bva[[bva_group, "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
+                           "Available", "Pct_Used", "Budget_FTE", "Actuals_FTE"]].copy()
+        bva_display.columns = [bva_group, "Budget", "YTD Actuals", "Encumbrance",
+                               "Available", "% Used", "Budget FTE", "Actual FTE"]
+        st.dataframe(
+            bva_display.style.format({
+                "Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
+                "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
+                "% Used": "{:.1f}%", "Budget FTE": "{:,.1f}", "Actual FTE": "{:,.1f}"
+            }).map(
+                lambda v: "color: #f43f5e; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
+                subset=["Available"]
+            ),
+            use_container_width=True, height=min(500, len(bva_display) * 35 + 60)
+        )
+
+    # ── CSV Export ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">Budget Authority Export</div>', unsafe_allow_html=True)
+
+    if selected_entity != "— All Entities —":
+        exp_budget_report = build_budget_report(bud_raw, selected_entity, "E")
+        rev_budget_report = build_budget_report(bud_raw, selected_entity, "R")
+
+        entity_short = selected_entity.replace(" ", "_").replace("/", "-")
+        fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
+
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            st.markdown(f"**Expenditure Budget** — {len(exp_budget_report):,} lines")
+            if len(exp_budget_report) > 0:
+                st.dataframe(exp_budget_report, use_container_width=True, height=300)
+                e1, e2 = st.columns(2)
+                with e1:
+                    st.download_button(
+                        "📥 Exp Budget CSV",
+                        data=exp_budget_report.to_csv(index=False),
+                        file_name=f"{entity_short}_fy{fy_code}_exp_budget.csv",
+                        mime="text/csv", key="dl_bud_exp_csv"
+                    )
+                with e2:
+                    st.download_button(
+                        "📥 Exp Budget Excel",
+                        data=to_excel_download(exp_budget_report, "Exp Budget"),
+                        file_name=f"{entity_short}_fy{fy_code}_exp_budget.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_bud_exp_xlsx"
+                    )
+
+        with bc2:
+            st.markdown(f"**Revenue Budget** — {len(rev_budget_report):,} lines")
+            if len(rev_budget_report) > 0:
+                st.dataframe(rev_budget_report, use_container_width=True, height=300)
+                r1, r2 = st.columns(2)
+                with r1:
+                    st.download_button(
+                        "📥 Rev Budget CSV",
+                        data=rev_budget_report.to_csv(index=False),
+                        file_name=f"{entity_short}_fy{fy_code}_rev_budget.csv",
+                        mime="text/csv", key="dl_bud_rev_csv"
+                    )
+                with r2:
+                    st.download_button(
+                        "📥 Rev Budget Excel",
+                        data=to_excel_download(rev_budget_report, "Rev Budget"),
+                        file_name=f"{entity_short}_fy{fy_code}_rev_budget.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_bud_rev_xlsx"
+                    )
+    else:
+        st.info("Select a specific entity in the sidebar to generate budget authority CSV exports.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3: ACTUALS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_actuals:
+
+    st.markdown('<div class="section-header">Actuals Analysis & Export</div>', unsafe_allow_html=True)
+
+    act_act_f, act_bud_f, act_acct_type = render_tab_filters(
+        "actuals", act_global, bud_global, dims=FILTER_DIMS, show_acct_type=True
     )
+    act_acct_label = "Expenditure" if act_acct_type == "E" else "Revenue"
 
-    # ── Period for actuals ───────────────────────────────────────────────
-    act_for_report = act_raw
-    if selected_period:
-        act_for_report = act_for_report[act_for_report["Reporting Period"] == selected_period]
+    # ── KPIs ─────────────────────────────────────────────────────────────
+    act_budget_t = act_bud_f["Adjusted Amt"].sum() if len(act_bud_f) > 0 else 0
+    act_ytd_t = act_act_f["Actuals YTDAmount"].sum() if len(act_act_f) > 0 else 0
+    act_enc_t = act_act_f["Actuals Encumbrance"].sum() if len(act_act_f) > 0 else 0
+    act_bal_t = act_budget_t - act_ytd_t - act_enc_t
+    act_pct = (act_ytd_t / act_budget_t * 100) if act_budget_t else 0
+    act_comm = ((act_ytd_t + act_enc_t) / act_budget_t * 100) if act_budget_t else 0
 
-    bud_for_report = bud_raw
+    ak1, ak2, ak3, ak4, ak5, ak6 = st.columns(6)
+    ak1.metric("Adjusted Budget", fmt_currency(act_budget_t, compact=True))
+    ak2.metric("YTD Actuals", fmt_currency(act_ytd_t, compact=True))
+    ak3.metric("Encumbrance", fmt_currency(act_enc_t, compact=True))
+    ak4.metric("Available Balance", fmt_currency(act_bal_t, compact=True))
+    ak5.metric("% Spent", fmt_pct(act_pct))
+    ak6.metric("% Committed", fmt_pct(act_comm))
 
-    # ── Build reports ────────────────────────────────────────────────────
-    if report_entity:
-        entity_short = report_entity.replace(" ", "_").replace("/", "-")
+    # ── Expenditure by Fund (donut + table) ──────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Spend Distribution")
+
+    if len(act_act_f) > 0:
+        spend_group = st.radio(
+            "View by", options=["Fund", "Function", "Object"],
+            index=0, horizontal=True, key="act_spend_group"
+        )
+
+        spend_data = act_act_f.groupby(spend_group).agg(
+            YTD=("Actuals YTDAmount", "sum"),
+            Enc=("Actuals Encumbrance", "sum"),
+        ).reset_index()
+        spend_data["Name"] = spend_data[spend_group].apply(extract_name)
+        spend_data = spend_data[spend_data["YTD"] > 0].sort_values("YTD", ascending=False)
+        total_spend = spend_data["YTD"].sum()
+        spend_data["Pct"] = spend_data["YTD"] / total_spend * 100
+
+        sc1, sc2 = st.columns([2, 3])
+        with sc1:
+            top_donut = spend_data.head(10)
+            fig_d = go.Figure(go.Pie(
+                labels=top_donut["Name"], values=top_donut["YTD"],
+                hole=0.5, textinfo="label+percent", textposition="outside",
+                marker=dict(colors=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e", "#8b5cf6",
+                                    "#06b6d4", "#84cc16", "#ec4899", "#f97316", "#6366f1"]),
+                hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>"
+            ))
+            fig_d.update_layout(**plotly_layout(height=350, showlegend=False,
+                                margin=dict(l=10, r=10, t=10, b=10)))
+            st.plotly_chart(fig_d, use_container_width=True)
+
+        with sc2:
+            sd = spend_data[[spend_group, "YTD", "Enc", "Pct"]].head(15).copy()
+            sd.columns = [spend_group, "YTD Actuals", "Encumbrance", "% of Total"]
+            st.dataframe(sd.style.format({
+                "YTD Actuals": "${:,.0f}", "Encumbrance": "${:,.0f}", "% of Total": "{:.1f}%"
+            }), use_container_width=True, height=min(400, len(sd) * 35 + 60))
+
+    # ── Budget vs Actuals by Function ────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Budget vs. Actuals by Function")
+
+    if len(act_act_f) > 0 and len(act_bud_f) > 0:
+        func_b = act_bud_f.groupby("Function").agg(Budget=("Adjusted Amt", "sum")).reset_index()
+        func_a = act_act_f.groupby("Function").agg(
+            YTD=("Actuals YTDAmount", "sum"), Enc=("Actuals Encumbrance", "sum")
+        ).reset_index()
+        func_m = func_b.merge(func_a, on="Function", how="outer").fillna(0)
+        func_m["Available"] = func_m["Budget"] - func_m["YTD"] - func_m["Enc"]
+        func_m["Pct_Used"] = ((func_m["YTD"] + func_m["Enc"]) / func_m["Budget"].replace(0, np.nan) * 100)
+        func_m["Name"] = func_m["Function"].apply(extract_name)
+        func_m = func_m.sort_values("Budget", ascending=False)
+
+        top_func = func_m[func_m["Budget"] > 0].head(12)
+        fig_fb = go.Figure()
+        fig_fb.add_trace(go.Bar(
+            name="YTD Actuals", y=top_func["Name"], x=top_func["YTD"],
+            orientation="h", marker_color="#4f8df5",
+            hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
+        ))
+        fig_fb.add_trace(go.Bar(
+            name="Encumbrance", y=top_func["Name"], x=top_func["Enc"],
+            orientation="h", marker_color="#f59e0b",
+            hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
+        ))
+        fig_fb.add_trace(go.Bar(
+            name="Available", y=top_func["Name"], x=top_func["Available"].clip(lower=0),
+            orientation="h", marker_color="#1e2130", marker_line=dict(color="#4f8df5", width=1),
+            hovertemplate="%{y}<br>Available: $%{x:,.0f}<extra></extra>"
+        ))
+        fig_fb.update_layout(
+            **plotly_layout(barmode="stack", height=max(300, len(top_func) * 32),
+            yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
+        )
+        st.plotly_chart(fig_fb, use_container_width=True)
+
+        st.dataframe(
+            func_m[["Function", "Budget", "YTD", "Enc", "Available", "Pct_Used"]].rename(columns={
+                "Budget": "Adjusted Budget", "YTD": "YTD Actuals", "Enc": "Encumbrance",
+                "Pct_Used": "% Used (Act+Enc)"
+            }).style.format({
+                "Adjusted Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
+                "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
+                "% Used (Act+Enc)": "{:.1f}%"
+            }).map(
+                lambda v: "color: #f43f5e; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
+                subset=["Available"]
+            ),
+            use_container_width=True, height=min(500, len(func_m) * 35 + 60)
+        )
+
+    # ── CSV Exports ──────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">Actuals Export</div>', unsafe_allow_html=True)
+
+    if selected_entity != "— All Entities —":
+        entity_short = selected_entity.replace(" ", "_").replace("/", "-")
         fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
         period_code = selected_period.lower() if selected_period else "all"
 
-        # CSV reports (existing)
-        exp_report = build_district_report(act_for_report, bud_for_report, report_entity, "E")
-        rev_report = build_district_report(act_for_report, bud_for_report, report_entity, "R")
+        exp_act_report = build_actuals_report(act_global, bud_global, selected_entity, "E")
+        rev_act_report = build_actuals_report(act_global, bud_global, selected_entity, "R")
 
-        # ── Summary metrics ──────────────────────────────────────────────
-        st.markdown(f"**{report_entity}** · FY {fy_label} · {period_label}")
-
-        # Compute totals for summary cards
-        exp_act_entity = act_for_report[
-            (act_for_report["Budget Entity"] == report_entity) &
-            (act_for_report["Account Type"] == "E")
-        ]
-        exp_bud_entity = bud_for_report[
-            (bud_for_report["Budget Entity"] == report_entity) &
-            (bud_for_report["Account Type"] == "E")
-        ]
-        rev_act_entity = act_for_report[
-            (act_for_report["Budget Entity"] == report_entity) &
-            (act_for_report["Account Type"] == "R")
-        ]
-
-        exp_budget_total = exp_bud_entity["Adjusted Amt"].sum()
-        exp_ytd_total = exp_act_entity["Actuals YTDAmount"].sum()
-        rev_ytd_total = rev_act_entity["Actuals YTDAmount"].sum()
-        net_total = rev_ytd_total - exp_ytd_total
-
-        rm1, rm2, rm3, rm4 = st.columns(4)
-        rm1.metric("Revenue YTD", fmt_currency(rev_ytd_total, compact=True))
-        rm2.metric("Expenditure YTD", fmt_currency(exp_ytd_total, compact=True))
-        rm3.metric("Net (Rev − Exp)", fmt_currency(net_total, compact=True))
-        rm4.metric("Exp. Adjusted Budget", fmt_currency(exp_budget_total, compact=True))
-
-        # ──────────────────────────────────────────────────────────────────
-        # CSV Data Export Section (existing functionality, preserved)
-        # ──────────────────────────────────────────────────────────────────
-        with st.expander("📥 CSV / Excel Data Exports", expanded=False):
-            st.markdown("**Expenditure Report**")
-            if len(exp_report) > 0:
-                st.dataframe(exp_report, use_container_width=True, height=300)
-                exp_filename = f"{entity_short}_fy{fy_code}_{period_code}_exp.csv"
-                ec1, ec2 = st.columns(2)
-                with ec1:
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            st.markdown(f"**Expenditure Actuals** — {len(exp_act_report):,} lines")
+            if len(exp_act_report) > 0:
+                st.dataframe(exp_act_report, use_container_width=True, height=300)
+                ae1, ae2 = st.columns(2)
+                with ae1:
                     st.download_button(
-                        "📥 Expenditure CSV",
-                        data=exp_report.to_csv(index=False),
-                        file_name=exp_filename,
-                        mime="text/csv",
-                        key="dl_exp_csv"
+                        "📥 Exp Actuals CSV",
+                        data=exp_act_report.to_csv(index=False),
+                        file_name=f"{entity_short}_fy{fy_code}_{period_code}_exp.csv",
+                        mime="text/csv", key="dl_act_exp_csv"
                     )
-                with ec2:
+                with ae2:
                     st.download_button(
-                        "📥 Expenditure Excel",
-                        data=to_excel_download(exp_report, "Expenditures"),
-                        file_name=exp_filename.replace(".csv", ".xlsx"),
+                        "📥 Exp Actuals Excel",
+                        data=to_excel_download(exp_act_report, "Expenditures"),
+                        file_name=f"{entity_short}_fy{fy_code}_{period_code}_exp.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_exp_xlsx"
+                        key="dl_act_exp_xlsx"
                     )
-            else:
-                st.info("No expenditure data for this entity.")
 
-            st.markdown("---")
-            st.markdown("**Revenue Report**")
-            if len(rev_report) > 0:
-                st.dataframe(rev_report, use_container_width=True, height=300)
-                rev_filename = f"{entity_short}_fy{fy_code}_{period_code}_rev.csv"
-                rc1, rc2 = st.columns(2)
-                with rc1:
+        with ac2:
+            st.markdown(f"**Revenue Actuals** — {len(rev_act_report):,} lines")
+            if len(rev_act_report) > 0:
+                st.dataframe(rev_act_report, use_container_width=True, height=300)
+                ar1, ar2 = st.columns(2)
+                with ar1:
                     st.download_button(
-                        "📥 Revenue CSV",
-                        data=rev_report.to_csv(index=False),
-                        file_name=rev_filename,
-                        mime="text/csv",
-                        key="dl_rev_csv"
+                        "📥 Rev Actuals CSV",
+                        data=rev_act_report.to_csv(index=False),
+                        file_name=f"{entity_short}_fy{fy_code}_{period_code}_rev.csv",
+                        mime="text/csv", key="dl_act_rev_csv"
                     )
-                with rc2:
+                with ar2:
                     st.download_button(
-                        "📥 Revenue Excel",
-                        data=to_excel_download(rev_report, "Revenue"),
-                        file_name=rev_filename.replace(".csv", ".xlsx"),
+                        "📥 Rev Actuals Excel",
+                        data=to_excel_download(rev_act_report, "Revenue"),
+                        file_name=f"{entity_short}_fy{fy_code}_{period_code}_rev.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_rev_xlsx"
+                        key="dl_act_rev_xlsx"
                     )
-            else:
-                st.info("No revenue data for this entity.")
-
-        # ──────────────────────────────────────────────────────────────────
-        # NEW: Entity Financial Analysis (Sections 4–7)
-        # ──────────────────────────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown('<div class="section-header">Financial Analysis</div>', unsafe_allow_html=True)
-        st.caption("Interactive analysis for the selected entity. Use the HTML export button below to generate a standalone report.")
-
-        # ── Section 4: Revenue vs Expenditure by Fund ────────────────────
-        st.markdown("#### Revenue vs. Expenditure by Fund")
-
-        rev_exp_df = compute_entity_rev_vs_exp(act_for_report, bud_for_report, report_entity)
-
-        if len(rev_exp_df) > 0:
-            top_rev_exp = rev_exp_df.head(12)
-
-            fig_revexp = go.Figure()
-            fig_revexp.add_trace(go.Bar(
-                name="Revenue YTD",
-                x=top_rev_exp["Fund_Name"],
-                y=top_rev_exp["Revenue_YTD"],
-                marker_color="#4f8df5",
-                hovertemplate="%{x}<br>Revenue: $%{y:,.0f}<extra></extra>"
-            ))
-            fig_revexp.add_trace(go.Bar(
-                name="Expenditure YTD",
-                x=top_rev_exp["Fund_Name"],
-                y=top_rev_exp["Expenditure_YTD"],
-                marker_color="#f59e0b",
-                hovertemplate="%{x}<br>Expenditure: $%{y:,.0f}<extra></extra>"
-            ))
-            fig_revexp.update_layout(
-                **PLOTLY_TEMPLATE["layout"].to_plotly_json(),
-                barmode="group",
-                height=400,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                xaxis_tickangle=-30,
-                yaxis_title=""
-            )
-            st.plotly_chart(fig_revexp, use_container_width=True)
-        else:
-            st.info("No revenue or expenditure data available.")
-
-        # ── Section 5: Funds Where Exp > Rev ─────────────────────────────
-        st.markdown("#### Funds Where Expenditures Exceed Revenue")
-
-        if len(rev_exp_df) > 0:
-            non_reimb, reimb, other_funds = compute_funds_exp_exceed_rev(rev_exp_df)
-
-            s5_c1, s5_c2 = st.columns(2)
-
-            with s5_c1:
-                st.markdown("**Non-Reimbursable Funds** _(real cash concern)_")
-                if len(non_reimb) > 0:
-                    nr_display = non_reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
-                    nr_display.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
-                    st.dataframe(
-                        nr_display.style.format({
-                            "Revenue YTD": "${:,.0f}",
-                            "Expenditure YTD": "${:,.0f}",
-                            "Net": "${:,.0f}"
-                        }).map(
-                            lambda v: "color: #f43f5e" if isinstance(v, (int, float)) and v < 0 else "",
-                            subset=["Net"]
-                        ),
-                        use_container_width=True,
-                        height=min(300, max(100, len(non_reimb) * 40 + 60))
-                    )
-                else:
-                    st.success("No non-reimbursable fund deficits found.")
-
-            with s5_c2:
-                st.markdown("**Reimbursable Funds** _(expected: spend first, reimburse later)_")
-                if len(reimb) > 0:
-                    r_display = reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
-                    r_display.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
-                    st.dataframe(
-                        r_display.style.format({
-                            "Revenue YTD": "${:,.0f}",
-                            "Expenditure YTD": "${:,.0f}",
-                            "Net": "${:,.0f}"
-                        }),
-                        use_container_width=True,
-                        height=min(300, max(100, len(reimb) * 40 + 60))
-                    )
-                else:
-                    st.info("No reimbursable fund deficits.")
-
-            if len(other_funds) > 0:
-                with st.expander(f"Other / Unclassified Funds ({len(other_funds)})"):
-                    o_display = other_funds[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
-                    o_display.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
-                    st.dataframe(
-                        o_display.style.format({
-                            "Revenue YTD": "${:,.0f}",
-                            "Expenditure YTD": "${:,.0f}",
-                            "Net": "${:,.0f}"
-                        }),
-                        use_container_width=True
-                    )
-
-        # ── Section 6: Expenditure Distribution by Fund ──────────────────
-        st.markdown("#### Expenditure Distribution by Fund")
-
-        fund_dist = compute_exp_by_fund_type(act_for_report, report_entity)
-
-        if len(fund_dist) > 0 and fund_dist["YTD_Actuals"].sum() > 0:
-            s6_c1, s6_c2 = st.columns([2, 3])
-
-            with s6_c1:
-                fund_donut_data = fund_dist[fund_dist["YTD_Actuals"] > 0].head(10)
-                fig_donut = go.Figure(go.Pie(
-                    labels=fund_donut_data["Fund_Name"],
-                    values=fund_donut_data["YTD_Actuals"],
-                    hole=0.5,
-                    textinfo="label+percent",
-                    textposition="outside",
-                    marker=dict(
-                        colors=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e", "#8b5cf6",
-                                "#06b6d4", "#84cc16", "#ec4899", "#f97316", "#6366f1"]
-                    ),
-                    hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>"
-                ))
-                tmpl_donut = PLOTLY_TEMPLATE["layout"].to_plotly_json()
-                tmpl_donut["margin"] = dict(l=10, r=10, t=10, b=10)
-                fig_donut.update_layout(**tmpl_donut, height=350, showlegend=False)
-                st.plotly_chart(fig_donut, use_container_width=True)
-
-            with s6_c2:
-                fd_display = fund_dist.head(10)[["Fund", "YTD_Actuals", "Pct_of_Total"]].copy()
-                fd_display.columns = ["Fund", "YTD Spend", "% of Total"]
-                st.dataframe(
-                    fd_display.style.format({
-                        "YTD Spend": "${:,.0f}",
-                        "% of Total": "{:.1f}%"
-                    }),
-                    use_container_width=True,
-                    height=min(400, max(150, len(fd_display) * 40 + 60))
-                )
-        else:
-            st.info("No expenditure data available for fund distribution.")
-
-        # ── Section 7: Expenditure by Function ───────────────────────────
-        st.markdown("#### Expenditure by Function")
-
-        func_data = compute_exp_by_function(act_for_report, bud_for_report, report_entity)
-
-        if len(func_data) > 0:
-            func_chart_data = func_data[func_data["Adjusted_Budget"] > 0].head(12)
-
-            fig_func_bar = go.Figure()
-            fig_func_bar.add_trace(go.Bar(
-                name="YTD Actuals",
-                y=func_chart_data["Function_Name"],
-                x=func_chart_data["YTD_Actuals"],
-                orientation="h",
-                marker_color="#4f8df5",
-                hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
-            ))
-            fig_func_bar.add_trace(go.Bar(
-                name="Encumbrance",
-                y=func_chart_data["Function_Name"],
-                x=func_chart_data["Encumbrance"],
-                orientation="h",
-                marker_color="#f59e0b",
-                hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
-            ))
-            fig_func_bar.add_trace(go.Bar(
-                name="Available",
-                y=func_chart_data["Function_Name"],
-                x=func_chart_data["Available"].clip(lower=0),
-                orientation="h",
-                marker_color="#1e2130",
-                marker_line=dict(color="#4f8df5", width=1),
-                hovertemplate="%{y}<br>Available: $%{x:,.0f}<extra></extra>"
-            ))
-            tmpl_func = PLOTLY_TEMPLATE["layout"].to_plotly_json()
-            tmpl_func["yaxis"] = dict(autorange="reversed", gridcolor="#1e2130", zerolinecolor="#2a2d3e")
-            fig_func_bar.update_layout(
-                **tmpl_func,
-                barmode="stack",
-                height=max(300, len(func_chart_data) * 35),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                xaxis_title=""
-            )
-            st.plotly_chart(fig_func_bar, use_container_width=True)
-
-            # Function detail table
-            func_table = func_data[["Function", "Adjusted_Budget", "YTD_Actuals",
-                                     "Encumbrance", "Available", "Pct_Used"]].copy()
-            func_table.columns = ["Function", "Budget", "YTD Actuals", "Encumbered", "Available", "% Used (Act+Enc)"]
-            st.dataframe(
-                func_table.style.format({
-                    "Budget": "${:,.0f}",
-                    "YTD Actuals": "${:,.0f}",
-                    "Encumbered": "${:,.0f}",
-                    "Available": "${:,.0f}",
-                    "% Used (Act+Enc)": "{:.1f}%"
-                }),
-                use_container_width=True,
-                height=min(500, max(150, len(func_table) * 40 + 60))
-            )
-        else:
-            st.info("No function-level expenditure data available.")
-
-        # ──────────────────────────────────────────────────────────────────
-        # HTML Export Button
-        # ──────────────────────────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown('<div class="section-header">Export Analysis</div>', unsafe_allow_html=True)
-
-        summary_stats = {
-            "rev_ytd": rev_ytd_total,
-            "exp_ytd": exp_ytd_total,
-            "net": net_total,
-            "exp_budget": exp_budget_total,
-        }
-
-        # Compute data for HTML export
-        if len(rev_exp_df) > 0:
-            non_reimb_html, reimb_html, other_html = compute_funds_exp_exceed_rev(rev_exp_df)
-        else:
-            non_reimb_html = reimb_html = other_html = pd.DataFrame()
-
-        fund_dist_html = compute_exp_by_fund_type(act_for_report, report_entity) if len(act_for_report) > 0 else pd.DataFrame()
-        func_html = compute_exp_by_function(act_for_report, bud_for_report, report_entity)
-
-        html_content = build_html_report(
-            entity_name=report_entity,
-            fy_label=fy_label,
-            period_label=period_label,
-            rev_exp_df=rev_exp_df if len(rev_exp_df) > 0 else pd.DataFrame(columns=["Fund","Revenue_YTD","Expenditure_YTD","Fund_Name"]),
-            non_reimb_df=non_reimb_html,
-            reimb_df=reimb_html,
-            other_df=other_html,
-            fund_dist_df=fund_dist_html if len(fund_dist_html) > 0 else pd.DataFrame(columns=["Fund","YTD_Actuals","Fund_Name","Pct_of_Total"]),
-            func_df=func_html if len(func_html) > 0 else pd.DataFrame(columns=["Function","Adjusted_Budget","YTD_Actuals","Encumbrance","Available","Pct_Used"]),
-            summary_stats=summary_stats
-        )
-
-        html_filename = f"{entity_short}_fy{fy_code}_{period_code}_analysis.html"
-
-        st.download_button(
-            "📄 Download HTML Analysis Report",
-            data=html_content,
-            file_name=html_filename,
-            mime="text/html",
-            key="dl_html_report"
-        )
-        st.caption(
-            "This HTML report includes Sections 1, 4–7 from the quarterly review template. "
-            "Sections requiring your memo (Key Concerns, Compliance, Audit Findings, Action Items) "
-            "can be added after export or in a future update."
-        )
+    else:
+        st.info("Select a specific entity in the sidebar to generate actuals CSV exports.")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 6: Data Export (unchanged)
-# ════════════════════════════════════════════════════════════════════════════
-with tab_data:
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4: SALARY & BENEFITS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_salary:
 
-    st.markdown('<div class="section-header">Filtered Data Export</div>', unsafe_allow_html=True)
-    st.caption("Export the currently filtered data to Excel or CSV.")
+    st.markdown('<div class="section-header">Salary & Benefits Analysis</div>', unsafe_allow_html=True)
 
-    exp1, exp2 = st.columns(2)
+    # Filter to expenditures only, salary/benefits/contracted objects
+    sal_act = act_global[act_global["Account Type"] == "E"].copy() if len(act_global) > 0 else pd.DataFrame()
+    sal_bud = bud_global[bud_global["Account Type"] == "E"].copy() if len(bud_global) > 0 else pd.DataFrame()
 
-    with exp1:
-        st.markdown("**Budget Data** (filtered)")
-        st.write(f"{len(bud_f):,} rows")
-        if len(bud_f) > 0:
-            st.dataframe(bud_f.head(100), use_container_width=True, height=300)
-            col_dl1, col_dl2 = st.columns(2)
-            with col_dl1:
-                st.download_button(
-                    "📥 Download Excel",
-                    data=to_excel_download(bud_f, "Budget"),
-                    file_name=f"budget_export_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            with col_dl2:
-                st.download_button(
-                    "📥 Download CSV",
-                    data=bud_f.to_csv(index=False),
-                    file_name=f"budget_export_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
+    # Add classification columns
+    if len(sal_act) > 0:
+        sal_act["Obj_Category"] = sal_act["Object"].apply(classify_object_category)
+        sal_act["Func_Category"] = sal_act["Function"].apply(classify_function_category)
+    if len(sal_bud) > 0:
+        sal_bud["Obj_Category"] = sal_bud["Object"].apply(classify_object_category)
+        sal_bud["Func_Category"] = sal_bud["Function"].apply(classify_function_category)
 
-    with exp2:
-        st.markdown("**Actuals Data** (filtered)")
-        st.write(f"{len(act_f):,} rows")
-        if len(act_f) > 0:
-            st.dataframe(act_f.head(100), use_container_width=True, height=300)
-            col_dl3, col_dl4 = st.columns(2)
-            with col_dl3:
-                st.download_button(
-                    "📥 Download Excel",
-                    data=to_excel_download(act_f, "Actuals"),
-                    file_name=f"actuals_export_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            with col_dl4:
-                st.download_button(
-                    "📥 Download CSV",
-                    data=act_f.to_csv(index=False),
-                    file_name=f"actuals_export_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
+    # Tab-level filters (Fund, Function, Location)
+    with st.expander("🔍 Filters", expanded=False):
+        sf1, sf2, sf3 = st.columns(3)
+        with sf1:
+            sal_funds = st.multiselect("Fund", get_unique_values(sal_act, sal_bud, "Fund"),
+                                        default=[], key="sal_fund")
+        with sf2:
+            sal_funcs = st.multiselect("Function", get_unique_values(sal_act, sal_bud, "Function"),
+                                        default=[], key="sal_func")
+        with sf3:
+            sal_locs = st.multiselect("Location", get_unique_values(sal_act, sal_bud, "Location"),
+                                       default=[], key="sal_loc")
 
+    sal_filters = {}
+    if sal_funds: sal_filters["Fund"] = sal_funds
+    if sal_funcs: sal_filters["Function"] = sal_funcs
+    if sal_locs: sal_filters["Location"] = sal_locs
+
+    sal_act = apply_dim_filters(sal_act, sal_filters)
+    sal_bud = apply_dim_filters(sal_bud, sal_filters)
+
+    # ── Salary / Benefits / Contracted breakdown ─────────────────────────
+    st.markdown("#### Expenditure Composition")
+
+    if len(sal_act) > 0:
+        comp = sal_act.groupby("Obj_Category").agg(
+            YTD=("Actuals YTDAmount", "sum"), Enc=("Actuals Encumbrance", "sum")
+        ).reset_index()
+        comp["Total"] = comp["YTD"] + comp["Enc"]
+        comp = comp.sort_values("YTD", ascending=False)
+        grand_total = comp["YTD"].sum()
+        comp["Pct"] = comp["YTD"] / grand_total * 100
+
+        comp_bud = sal_bud.groupby("Obj_Category").agg(
+            Budget=("Adjusted Amt", "sum")
+        ).reset_index() if len(sal_bud) > 0 else pd.DataFrame(columns=["Obj_Category", "Budget"])
+
+        comp = comp.merge(comp_bud, on="Obj_Category", how="left").fillna(0)
+        comp["Pct_Used"] = ((comp["YTD"] + comp["Enc"]) / comp["Budget"].replace(0, np.nan) * 100)
+
+        # KPI cards for salary / benefits / contracted
+        sal_row = comp[comp["Obj_Category"] == "Salaries"]
+        ben_row = comp[comp["Obj_Category"] == "Benefits"]
+        con_row = comp[comp["Obj_Category"] == "Contracted Services"]
+
+        sk1, sk2, sk3, sk4 = st.columns(4)
+        sk1.metric("Salary YTD",
+                    fmt_currency(sal_row["YTD"].sum() if len(sal_row) > 0 else 0, compact=True),
+                    delta=f"{sal_row['Pct'].sum():.0f}% of total" if len(sal_row) > 0 else None,
+                    delta_color="off")
+        sk2.metric("Benefits YTD",
+                    fmt_currency(ben_row["YTD"].sum() if len(ben_row) > 0 else 0, compact=True),
+                    delta=f"{ben_row['Pct'].sum():.0f}% of total" if len(ben_row) > 0 else None,
+                    delta_color="off")
+        sk3.metric("Contracted Svcs YTD",
+                    fmt_currency(con_row["YTD"].sum() if len(con_row) > 0 else 0, compact=True),
+                    delta=f"{con_row['Pct'].sum():.0f}% of total" if len(con_row) > 0 else None,
+                    delta_color="off")
+        sk4.metric("All Other YTD",
+                    fmt_currency(grand_total - sal_row["YTD"].sum() - ben_row["YTD"].sum() - con_row["YTD"].sum(), compact=True))
+
+        # Composition bar
+        fig_comp = go.Figure(go.Bar(
+            x=comp["YTD"], y=comp["Obj_Category"], orientation="h",
+            text=comp["Pct"].apply(lambda v: f"{v:.1f}%"),
+            textposition="auto",
+            marker_color=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e",
+                           "#8b5cf6", "#84cc16", "#ec4899"][:len(comp)],
+            hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
+        ))
+        fig_comp.update_layout(**plotly_layout(height=max(200, len(comp) * 40),
+                                yaxis=dict(autorange="reversed"), xaxis_title=""))
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        st.dataframe(comp[["Obj_Category", "Budget", "YTD", "Enc", "Pct", "Pct_Used"]].rename(columns={
+            "Obj_Category": "Category", "Pct": "% of Total Exp", "Pct_Used": "% of Budget Used"
+        }).style.format({
+            "Budget": "${:,.0f}", "YTD": "${:,.0f}", "Enc": "${:,.0f}",
+            "% of Total Exp": "{:.1f}%", "% of Budget Used": "{:.1f}%"
+        }), use_container_width=True)
+
+    # ── FTE Analysis ─────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown('<div class="section-header">Budget vs Actuals Summary Export</div>', unsafe_allow_html=True)
+    st.markdown("#### FTE: Budget vs. Actual")
 
-    summary_by = st.selectbox(
-        "Summarize by",
-        options=["Budget Entity", "Fund", "Function", "Object", "Program"],
-        key="export_summary"
-    )
-    bva_export = compute_budget_vs_actuals(act_f, bud_f, summary_by)
-    bva_export.columns = [summary_by, "Adjusted Budget", "Final Budget", "Budget FTE",
-                           "YTD Actuals", "Period Actuals", "Encumbrance", "Actual FTE",
-                           "Budget Balance", "% Spent", "% Committed"]
+    # Focus on salary objects (51xxx) which carry FTE
+    sal_fte_act = sal_act[sal_act["Obj_Category"] == "Salaries"] if len(sal_act) > 0 else pd.DataFrame()
+    sal_fte_bud = sal_bud[sal_bud["Obj_Category"] == "Salaries"] if len(sal_bud) > 0 else pd.DataFrame()
 
-    st.dataframe(
-        bva_export.style.format({
-            "Adjusted Budget": "${:,.0f}",
-            "Final Budget": "${:,.0f}",
-            "YTD Actuals": "${:,.0f}",
-            "Period Actuals": "${:,.0f}",
-            "Encumbrance": "${:,.0f}",
-            "Budget Balance": "${:,.0f}",
-            "% Spent": "{:.1f}%",
-            "% Committed": "{:.1f}%",
-            "Budget FTE": "{:,.1f}",
-            "Actual FTE": "{:,.1f}"
-        }),
-        use_container_width=True,
-        height=400
-    )
+    if len(sal_fte_bud) > 0 or len(sal_fte_act) > 0:
+        fte_bud_total = sal_fte_bud["Adjusted FTE"].sum() if len(sal_fte_bud) > 0 else 0
+        fte_act_total = sal_fte_act["Actuals FTE"].sum() if len(sal_fte_act) > 0 else 0
+        fte_diff = fte_act_total - fte_bud_total
 
-    dl_s1, dl_s2 = st.columns(2)
-    with dl_s1:
-        st.download_button(
-            "📥 Summary to Excel",
-            data=to_excel_download(bva_export, "BvA_Summary"),
-            file_name=f"bva_summary_{summary_by.lower().replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        fk1, fk2, fk3 = st.columns(3)
+        fk1.metric("Budgeted FTE", f"{fte_bud_total:,.1f}")
+        fk2.metric("Actual FTE", f"{fte_act_total:,.1f}")
+        fk3.metric("Variance", f"{fte_diff:+,.1f}",
+                    delta_color="inverse" if fte_diff > 0 else "normal")
+
+        # FTE by Job Class
+        st.markdown("**FTE by Job Class**")
+
+        fte_bud_jc = sal_fte_bud.groupby("Job Class").agg(
+            Budget_FTE=("Adjusted FTE", "sum"),
+            Budget_Salary=("Adjusted Amt", "sum"),
+        ).reset_index() if len(sal_fte_bud) > 0 else pd.DataFrame(columns=["Job Class", "Budget_FTE", "Budget_Salary"])
+
+        fte_act_jc = sal_fte_act.groupby("Job Class").agg(
+            Actual_FTE=("Actuals FTE", "sum"),
+            Actual_Salary=("Actuals YTDAmount", "sum"),
+        ).reset_index() if len(sal_fte_act) > 0 else pd.DataFrame(columns=["Job Class", "Actual_FTE", "Actual_Salary"])
+
+        fte_jc = fte_bud_jc.merge(fte_act_jc, on="Job Class", how="outer").fillna(0)
+        fte_jc["FTE_Variance"] = fte_jc["Actual_FTE"] - fte_jc["Budget_FTE"]
+        fte_jc["Avg_Salary_Budget"] = (fte_jc["Budget_Salary"] / fte_jc["Budget_FTE"].replace(0, np.nan))
+        fte_jc["Avg_Salary_Actual"] = (fte_jc["Actual_Salary"] / fte_jc["Actual_FTE"].replace(0, np.nan))
+        fte_jc["JC_Name"] = fte_jc["Job Class"].apply(extract_name)
+        fte_jc = fte_jc.sort_values("Budget_FTE", ascending=False)
+
+        # Grouped bar: Budget FTE vs Actual FTE by Job Class
+        top_jc = fte_jc[fte_jc["Budget_FTE"] > 0].head(15)
+        if len(top_jc) > 0:
+            fig_fte = go.Figure()
+            fig_fte.add_trace(go.Bar(
+                name="Budget FTE", y=top_jc["JC_Name"], x=top_jc["Budget_FTE"],
+                orientation="h", marker_color="#4f8df5",
+                hovertemplate="%{y}<br>Budget: %{x:,.1f} FTE<extra></extra>"
+            ))
+            fig_fte.add_trace(go.Bar(
+                name="Actual FTE", y=top_jc["JC_Name"], x=top_jc["Actual_FTE"],
+                orientation="h", marker_color="#2dd4bf",
+                hovertemplate="%{y}<br>Actual: %{x:,.1f} FTE<extra></extra>"
+            ))
+            fig_fte.update_layout(
+                **plotly_layout(barmode="group", height=max(300, len(top_jc) * 32),
+                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
+            )
+            st.plotly_chart(fig_fte, use_container_width=True)
+
+        # Detail table
+        fte_display = fte_jc[["Job Class", "Budget_FTE", "Actual_FTE", "FTE_Variance",
+                              "Avg_Salary_Budget", "Avg_Salary_Actual",
+                              "Budget_Salary", "Actual_Salary"]].copy()
+        fte_display.columns = ["Job Class", "Budget FTE", "Actual FTE", "FTE Variance",
+                               "Avg Salary (Budget)", "Avg Salary (Actual)",
+                               "Total Budget", "Total YTD"]
+        st.dataframe(
+            fte_display.style.format({
+                "Budget FTE": "{:,.2f}", "Actual FTE": "{:,.2f}", "FTE Variance": "{:+,.2f}",
+                "Avg Salary (Budget)": "${:,.0f}", "Avg Salary (Actual)": "${:,.0f}",
+                "Total Budget": "${:,.0f}", "Total YTD": "${:,.0f}"
+            }).map(
+                lambda v: "color: #f43f5e" if isinstance(v, (int, float)) and v < -1
+                else ("color: #2dd4bf" if isinstance(v, (int, float)) and v > 1 else ""),
+                subset=["FTE Variance"]
+            ),
+            use_container_width=True, height=min(500, len(fte_display) * 35 + 60)
         )
-    with dl_s2:
-        st.download_button(
-            "📥 Summary to CSV",
-            data=bva_export.to_csv(index=False),
-            file_name=f"bva_summary_{summary_by.lower().replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
+
+    # ── Staffing Balance: Function Category ──────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Staffing Balance by Function")
+    st.caption(
+        "Compares FTE allocation across function categories. Watch for top-heavy "
+        "administration relative to instruction and support."
+    )
+
+    if len(sal_fte_bud) > 0 or len(sal_fte_act) > 0:
+        fb = sal_fte_bud.groupby("Func_Category").agg(
+            Budget_FTE=("Adjusted FTE", "sum"),
+            Budget_Salary=("Adjusted Amt", "sum"),
+        ).reset_index() if len(sal_fte_bud) > 0 else pd.DataFrame(columns=["Func_Category", "Budget_FTE", "Budget_Salary"])
+
+        fa = sal_fte_act.groupby("Func_Category").agg(
+            Actual_FTE=("Actuals FTE", "sum"),
+            Actual_Salary=("Actuals YTDAmount", "sum"),
+        ).reset_index() if len(sal_fte_act) > 0 else pd.DataFrame(columns=["Func_Category", "Actual_FTE", "Actual_Salary"])
+
+        fc = fb.merge(fa, on="Func_Category", how="outer").fillna(0)
+        fc_total_fte = fc["Actual_FTE"].sum()
+        fc["Pct_of_FTE"] = (fc["Actual_FTE"] / fc_total_fte * 100) if fc_total_fte > 0 else 0
+        fc = fc.sort_values("Budget_FTE", ascending=False)
+
+        sc1, sc2 = st.columns([2, 3])
+
+        with sc1:
+            fig_staff = go.Figure(go.Pie(
+                labels=fc["Func_Category"], values=fc["Actual_FTE"],
+                hole=0.45, textinfo="label+percent", textposition="outside",
+                marker=dict(colors=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e",
+                                    "#8b5cf6", "#84cc16", "#ec4899", "#06b6d4",
+                                    "#f97316", "#6366f1"][:len(fc)]),
+                hovertemplate="%{label}<br>FTE: %{value:,.1f}<br>%{percent}<extra></extra>"
+            ))
+            fig_staff.update_layout(**plotly_layout(height=350, showlegend=False,
+                                     margin=dict(l=10, r=10, t=10, b=10)))
+            st.plotly_chart(fig_staff, use_container_width=True)
+
+        with sc2:
+            fc_display = fc[["Func_Category", "Budget_FTE", "Actual_FTE",
+                             "Pct_of_FTE", "Budget_Salary", "Actual_Salary"]].copy()
+            fc_display.columns = ["Function Category", "Budget FTE", "Actual FTE",
+                                   "% of Total FTE", "Salary Budget", "Salary YTD"]
+            st.dataframe(fc_display.style.format({
+                "Budget FTE": "{:,.1f}", "Actual FTE": "{:,.1f}",
+                "% of Total FTE": "{:.1f}%",
+                "Salary Budget": "${:,.0f}", "Salary YTD": "${:,.0f}"
+            }), use_container_width=True, height=min(400, len(fc_display) * 35 + 60))
+
+    # ── Contracted Services ──────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Contracted Services (Object 53xxx)")
+    st.caption("Contracted services do not carry FTE but represent significant expenditures.")
+
+    con_act = sal_act[sal_act["Obj_Category"] == "Contracted Services"] if len(sal_act) > 0 else pd.DataFrame()
+    con_bud = sal_bud[sal_bud["Obj_Category"] == "Contracted Services"] if len(sal_bud) > 0 else pd.DataFrame()
+
+    if len(con_act) > 0 or len(con_bud) > 0:
+        con_b = con_bud.groupby(["Function", "Object"]).agg(
+            Budget=("Adjusted Amt", "sum")
+        ).reset_index() if len(con_bud) > 0 else pd.DataFrame(columns=["Function", "Object", "Budget"])
+
+        con_a = con_act.groupby(["Function", "Object"]).agg(
+            YTD=("Actuals YTDAmount", "sum"), Enc=("Actuals Encumbrance", "sum")
+        ).reset_index() if len(con_act) > 0 else pd.DataFrame(columns=["Function", "Object", "YTD", "Enc"])
+
+        con_m = con_b.merge(con_a, on=["Function", "Object"], how="outer").fillna(0)
+        con_m["Available"] = con_m["Budget"] - con_m["YTD"] - con_m["Enc"]
+        con_m["Pct_Used"] = ((con_m["YTD"] + con_m["Enc"]) / con_m["Budget"].replace(0, np.nan) * 100)
+        con_m = con_m.sort_values("Budget", ascending=False)
+
+        con_display = con_m[["Function", "Object", "Budget", "YTD", "Enc", "Available", "Pct_Used"]].copy()
+        con_display.columns = ["Function", "Object", "Budget", "YTD Actuals",
+                               "Encumbrance", "Available", "% Used"]
+        st.dataframe(
+            con_display.style.format({
+                "Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
+                "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
+                "% Used": "{:.1f}%"
+            }).map(
+                lambda v: "color: #f43f5e; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
+                subset=["Available"]
+            ),
+            use_container_width=True, height=min(500, len(con_display) * 35 + 60)
         )
+    else:
+        st.info("No contracted services data available.")
