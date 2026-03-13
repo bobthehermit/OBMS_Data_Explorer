@@ -18,163 +18,124 @@ from io import BytesIO
 from datetime import datetime
 import json
 import numpy as np
+import base64
+from pathlib import Path
+from PIL import Image
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="OBMS Financial Explorer",
-    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ── Custom Theme ─────────────────────────────────────────────────────────────
+# ── Brand CSS (NMPED palette) ────────────────────────────────────────────────
+# PED brand palette
+#   Primary teal:  #245d62   Dark teal: #1a474b
+#   Coral red:     #c64c43   Orange:    #f4784e
+#   Gold:          #edc872   Lt yellow: #fef0c3
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap');
+/* Layout */
+.block-container { padding-top: .8rem !important; }
 
-:root {
-    --bg-primary: #0f1117;
-    --bg-card: #1a1d2e;
-    --bg-card-hover: #222640;
-    --accent-blue: #4f8df5;
-    --accent-teal: #2dd4bf;
-    --accent-amber: #f59e0b;
-    --accent-rose: #f43f5e;
-    --accent-violet: #8b5cf6;
-    --text-primary: #e8eaed;
-    --text-secondary: #9ca3af;
-    --border-subtle: #2a2d3e;
+/* Metrics */
+.stMetric {
+    background: #fef0c3; padding: 14px; border-radius: 6px;
+    border-left: 4px solid #245d62;
+}
+.stMetric label { color: #245d62 !important; font-weight: 600; font-size: .85rem; }
+.stMetric [data-testid="stMetricValue"] {
+    color: #245d62 !important; font-weight: 700; font-size: 1.7rem;
 }
 
-html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif !important;
-}
+/* Headings */
+h1, h2, h3 { color: #245d62; }
 
-div[data-testid="stMetric"] {
-    background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-card-hover) 100%);
-    border: 1px solid var(--border-subtle);
-    border-radius: 12px;
-    padding: 16px 20px;
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
+/* Download buttons */
+.stDownloadButton button {
+    width: 100%; background: #245d62; color: #fff !important;
 }
-div[data-testid="stMetric"]:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(79, 141, 245, 0.15);
-}
-div[data-testid="stMetric"] label {
-    font-family: 'DM Sans', sans-serif !important;
-    font-weight: 500;
-    font-size: 0.8rem;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--text-secondary) !important;
-}
-div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-    font-family: 'JetBrains Mono', monospace !important;
-    font-weight: 500;
-    font-size: 1.6rem;
-}
+.stDownloadButton button:hover { background: #1a474b; }
+.stDownloadButton button p,
+.stDownloadButton button span,
+.stDownloadButton button:hover p,
+.stDownloadButton button:hover span { color: #fff !important; }
 
-section[data-testid="stSidebar"] {
-    background: #0d0f18;
-    border-right: 1px solid var(--border-subtle);
+/* Sidebar tags */
+[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] {
+    background: #245d62 !important; color: #fff !important;
 }
-section[data-testid="stSidebar"] .stSelectbox label,
-section[data-testid="stSidebar"] .stMultiSelect label,
-section[data-testid="stSidebar"] .stRadio label {
-    font-weight: 500;
-    font-size: 0.82rem;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-    color: var(--text-secondary) !important;
-}
+[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] span { color: #fff !important; }
+[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] svg  { fill: #fff !important; }
 
-button[data-baseweb="tab"] {
-    font-family: 'DM Sans', sans-serif !important;
-    font-weight: 600;
-    font-size: 0.9rem;
-    letter-spacing: 0.02em;
-}
+/* Links */
+a { color: #c64c43; text-decoration: none; }
+a:hover { color: #a03d35; text-decoration: underline; }
 
-div[data-testid="stDataFrame"] {
-    border-radius: 10px;
-    overflow: hidden;
-}
-
-.stDownloadButton > button {
-    background: linear-gradient(135deg, var(--accent-blue), var(--accent-violet)) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-    font-size: 0.85rem !important;
-    padding: 8px 20px !important;
-    transition: opacity 0.2s ease !important;
-}
-.stDownloadButton > button:hover {
-    opacity: 0.85 !important;
-}
-
+/* Section header */
 .section-header {
-    font-family: 'DM Sans', sans-serif;
     font-weight: 700;
     font-size: 1.1rem;
-    color: var(--text-secondary);
+    color: #245d62;
     text-transform: uppercase;
     letter-spacing: 0.08em;
     margin: 1.5rem 0 0.8rem 0;
     padding-bottom: 0.4rem;
-    border-bottom: 2px solid var(--accent-blue);
+    border-bottom: 2px solid #245d62;
     display: inline-block;
 }
 
+/* App title in sidebar */
 .app-title {
-    font-family: 'DM Sans', sans-serif;
     font-weight: 700;
     font-size: 1.6rem;
-    background: linear-gradient(135deg, #4f8df5, #2dd4bf);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    color: #245d62;
     margin-bottom: 0;
     line-height: 1.2;
 }
 .app-subtitle {
-    font-family: 'DM Sans', sans-serif;
     font-size: 0.78rem;
-    color: var(--text-secondary);
+    color: #666;
     letter-spacing: 0.06em;
     text-transform: uppercase;
     margin-top: 2px;
 }
 
+/* Expander details */
 details {
-    border: 1px solid var(--border-subtle) !important;
-    border-radius: 10px !important;
-    background: var(--bg-card) !important;
+    border: 1px solid #edc872 !important;
+    border-radius: 8px !important;
+}
+
+/* Tab styling */
+button[data-baseweb="tab"] {
+    font-weight: 600;
+    font-size: 0.9rem;
 }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Plotly Theme ─────────────────────────────────────────────────────────────
+# ── Plotly Theme (NMPED brand – light mode) ─────────────────────────────────
 _PLOTLY_BASE = dict(
-    font=dict(family="DM Sans, sans-serif", color="#e8eaed"),
+    font=dict(family="sans-serif", color="#333333"),
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
-    colorway=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e", "#8b5cf6",
-               "#06b6d4", "#84cc16", "#ec4899", "#f97316", "#6366f1"],
+    colorway=["#245d62", "#c64c43", "#edc872", "#f4784e", "#1a474b",
+               "#5a9ea3", "#8fae5f", "#d4956a", "#b85a3a", "#7a8c6e"],
     hoverlabel=dict(
-        bgcolor="#1a1d2e",
-        bordercolor="#4f8df5",
-        font=dict(family="DM Sans", color="#e8eaed", size=13)
+        bgcolor="#ffffff",
+        bordercolor="#245d62",
+        font=dict(family="sans-serif", color="#333333", size=13)
     ),
 )
 
 # Kept as a spreadable dict for simple cases (no xaxis/yaxis/margin overrides)
 PLOTLY_LAYOUT = {
     **_PLOTLY_BASE,
-    "xaxis": dict(gridcolor="#1e2130", zerolinecolor="#2a2d3e"),
-    "yaxis": dict(gridcolor="#1e2130", zerolinecolor="#2a2d3e"),
+    "xaxis": dict(gridcolor="#e5e7eb", zerolinecolor="#d1d5db"),
+    "yaxis": dict(gridcolor="#e5e7eb", zerolinecolor="#d1d5db"),
     "margin": dict(l=40, r=20, t=50, b=40),
 }
 
@@ -590,8 +551,29 @@ def classify_function_category(func_str):
 # SIDEBAR: Global Filters (Entity + FY + Period)
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown('<div class="app-title">OBMS Explorer</div>', unsafe_allow_html=True)
-    st.markdown('<div class="app-subtitle">NM PED · School Budget Bureau</div>', unsafe_allow_html=True)
+    # ── Logo ──────────────────────────────────────────────────────────────
+    LOGO_PATH = Path(__file__).parent / "300 DPI NM PED Logo JPEG.jpg"
+    LOGO_LINK = "https://web.ped.nm.gov/bureaus/school-budget-bureau/"
+
+    def _load_logo():
+        if not LOGO_PATH.exists():
+            return None
+        try:
+            buf = BytesIO()
+            Image.open(LOGO_PATH).save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            return (
+                f'<a href="{LOGO_LINK}" target="_blank">'
+                f'<img src="data:image/png;base64,{b64}" '
+                f'style="max-height:90px;height:auto;max-width:100%"></a>'
+            )
+        except Exception:
+            return None
+
+    logo = _load_logo()
+    if logo:
+        st.markdown(logo, unsafe_allow_html=True)
+    st.caption("School Budget Bureau")
     st.markdown("---")
 
     fy_options = sorted(ALL_FY_KEYS, reverse=True)
@@ -727,7 +709,7 @@ def render_tab_filters(tab_key: str, act_df: pd.DataFrame, bud_df: pd.DataFrame,
 st.markdown(f"""
 <div style="margin-bottom: 0.5rem;">
     <span class="app-title" style="font-size: 1.3rem;">OBMS Financial Explorer</span>
-    <span style="color: var(--text-secondary); font-size: 0.85rem; margin-left: 12px;">
+    <span style="color: #666; font-size: 0.85rem; margin-left: 12px;">
         {entity_label} · {fy_label} · {period_label}
     </span>
 </div>
@@ -793,12 +775,12 @@ with tab_overview:
         fig_revexp = go.Figure()
         fig_revexp.add_trace(go.Bar(
             name="Revenue YTD", x=top_chart["Fund_Name"], y=top_chart["Revenue_YTD"],
-            marker_color="#4f8df5",
+            marker_color="#245d62",
             hovertemplate="%{x}<br>Revenue: $%{y:,.0f}<extra></extra>"
         ))
         fig_revexp.add_trace(go.Bar(
             name="Expenditure YTD", x=top_chart["Fund_Name"], y=top_chart["Expenditure_YTD"],
-            marker_color="#f59e0b",
+            marker_color="#edc872",
             hovertemplate="%{x}<br>Expenditure: $%{y:,.0f}<extra></extra>"
         ))
         fig_revexp.update_layout(
@@ -865,10 +847,10 @@ with tab_overview:
             title={"text": "Exp. % Spent vs Expected", "font": {"size": 14}},
             gauge={
                 "axis": {"range": [0, 100], "ticksuffix": "%"},
-                "bar": {"color": "#4f8df5"}, "bgcolor": "#1a1d2e",
-                "steps": [{"range": [0, expected_pct], "color": "#1e2130"},
+                "bar": {"color": "#245d62"}, "bgcolor": "#fef0c3",
+                "steps": [{"range": [0, expected_pct], "color": "#f5f5f5"},
                           {"range": [expected_pct, 100], "color": "#1a1a2e"}],
-                "threshold": {"line": {"color": "#f59e0b", "width": 3},
+                "threshold": {"line": {"color": "#edc872", "width": 3},
                               "thickness": 0.8, "value": expected_pct}
             }
         ))
@@ -883,10 +865,10 @@ with tab_overview:
             title={"text": "Exp. % Committed (YTD + Enc)", "font": {"size": 14}},
             gauge={
                 "axis": {"range": [0, 120], "ticksuffix": "%"},
-                "bar": {"color": "#2dd4bf"}, "bgcolor": "#1a1d2e",
-                "steps": [{"range": [0, 100], "color": "#1e2130"},
+                "bar": {"color": "#c64c43"}, "bgcolor": "#fef0c3",
+                "steps": [{"range": [0, 100], "color": "#f5f5f5"},
                           {"range": [100, 120], "color": "#3d1515"}],
-                "threshold": {"line": {"color": "#f43f5e", "width": 3},
+                "threshold": {"line": {"color": "#f4784e", "width": 3},
                               "thickness": 0.8, "value": 100}
             }
         ))
@@ -902,10 +884,10 @@ with tab_overview:
             title={"text": "Revenue % Collected vs Expected", "font": {"size": 14}},
             gauge={
                 "axis": {"range": [0, 120], "ticksuffix": "%"},
-                "bar": {"color": "#84cc16"}, "bgcolor": "#1a1d2e",
-                "steps": [{"range": [0, expected_pct], "color": "#1e2130"},
+                "bar": {"color": "#8fae5f"}, "bgcolor": "#fef0c3",
+                "steps": [{"range": [0, expected_pct], "color": "#f5f5f5"},
                           {"range": [expected_pct, 120], "color": "#1a1a2e"}],
-                "threshold": {"line": {"color": "#f59e0b", "width": 3},
+                "threshold": {"line": {"color": "#edc872", "width": 3},
                               "thickness": 0.8, "value": expected_pct}
             }
         ))
@@ -938,7 +920,7 @@ with tab_overview:
                 texttemplate="%{label}<br>$%{value:,.0f}<br>%{percentRoot:.1%}",
                 marker=dict(
                     colors=func_merged["Pct_Spent"].head(12).fillna(0),
-                    colorscale=[[0, "#2dd4bf"], [0.5, "#4f8df5"], [1, "#f43f5e"]],
+                    colorscale=[[0, "#245d62"], [0.5, "#edc872"], [1, "#c64c43"]],
                     showscale=True,
                     colorbar=dict(title="% Spent", ticksuffix="%")
                 ),
@@ -1002,18 +984,18 @@ with tab_budget:
             fig_rev_bud.add_trace(go.Bar(
                 name="Beginning", y=rev_by_fund_bud["Fund_Name"].head(10),
                 x=rev_by_fund_bud["Beginning"].head(10),
-                orientation="h", marker_color="#4f8df5",
+                orientation="h", marker_color="#245d62",
                 hovertemplate="%{y}<br>Beginning: $%{x:,.0f}<extra></extra>"
             ))
             fig_rev_bud.add_trace(go.Bar(
                 name="BAR Adjustments", y=rev_by_fund_bud["Fund_Name"].head(10),
                 x=rev_by_fund_bud["Adjustments"].head(10),
-                orientation="h", marker_color="#2dd4bf",
+                orientation="h", marker_color="#c64c43",
                 hovertemplate="%{y}<br>Adjustments: $%{x:,.0f}<extra></extra>"
             ))
             fig_rev_bud.update_layout(
                 **plotly_layout(barmode="stack", height=350,
-                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
             st.plotly_chart(fig_rev_bud, use_container_width=True)
@@ -1034,18 +1016,18 @@ with tab_budget:
             fig_exp_bud.add_trace(go.Bar(
                 name="Beginning", y=exp_by_func_bud["Func_Name"].head(10),
                 x=exp_by_func_bud["Beginning"].head(10),
-                orientation="h", marker_color="#f59e0b",
+                orientation="h", marker_color="#edc872",
                 hovertemplate="%{y}<br>Beginning: $%{x:,.0f}<extra></extra>"
             ))
             fig_exp_bud.add_trace(go.Bar(
                 name="BAR Adjustments", y=exp_by_func_bud["Func_Name"].head(10),
                 x=exp_by_func_bud["Adjustments"].head(10),
-                orientation="h", marker_color="#f43f5e",
+                orientation="h", marker_color="#f4784e",
                 hovertemplate="%{y}<br>Adjustments: $%{x:,.0f}<extra></extra>"
             ))
             fig_exp_bud.update_layout(
                 **plotly_layout(barmode="stack", height=350,
-                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
             st.plotly_chart(fig_exp_bud, use_container_width=True)
@@ -1076,19 +1058,19 @@ with tab_budget:
                 name="Increases",
                 y=bar_by_fund["Fund_Name"].head(12),
                 x=bar_by_fund["Increases"].head(12),
-                orientation="h", marker_color="#2dd4bf",
+                orientation="h", marker_color="#c64c43",
                 hovertemplate="%{y}<br>Increases: $%{x:,.0f}<extra></extra>"
             ))
             fig_bar.add_trace(go.Bar(
                 name="Decreases",
                 y=bar_by_fund["Fund_Name"].head(12),
                 x=bar_by_fund["Decreases"].head(12),
-                orientation="h", marker_color="#f43f5e",
+                orientation="h", marker_color="#f4784e",
                 hovertemplate="%{y}<br>Decreases: $%{x:,.0f}<extra></extra>"
             ))
             fig_bar.update_layout(
                 **plotly_layout(barmode="relative", height=max(300, min(12, len(bar_by_fund)) * 32),
-                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 title=f"{bud_acct_label} BAR Adjustments by Fund")
             )
@@ -1107,8 +1089,8 @@ with tab_budget:
                     "Beginning": "${:,.0f}", "Adjustment": "${:,.0f}",
                     "Adjusted": "${:,.0f}", "FTE_Adj": "{:,.2f}"
                 }).map(
-                    lambda v: "color: #2dd4bf" if isinstance(v, (int, float)) and v > 0
-                    else ("color: #f43f5e" if isinstance(v, (int, float)) and v < 0 else ""),
+                    lambda v: "color: #245d62" if isinstance(v, (int, float)) and v > 0
+                    else ("color: #c64c43" if isinstance(v, (int, float)) and v < 0 else ""),
                     subset=["Adjustment"]
                 ),
                 use_container_width=True, height=min(500, len(bar_detail) * 35 + 60)
@@ -1158,22 +1140,22 @@ with tab_budget:
         fig_bva = go.Figure()
         fig_bva.add_trace(go.Bar(
             name="YTD Actuals", y=top_bva["Name"], x=top_bva["YTD_Actuals"],
-            orientation="h", marker_color="#4f8df5",
+            orientation="h", marker_color="#245d62",
             hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
         ))
         fig_bva.add_trace(go.Bar(
             name="Encumbrance", y=top_bva["Name"], x=top_bva["Encumbrance"],
-            orientation="h", marker_color="#f59e0b",
+            orientation="h", marker_color="#edc872",
             hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
         ))
         fig_bva.add_trace(go.Bar(
             name="Available", y=top_bva["Name"], x=top_bva["Available"].clip(lower=0),
-            orientation="h", marker_color="#1e2130", marker_line=dict(color="#4f8df5", width=1),
+            orientation="h", marker_color="#f0f0f0", marker_line=dict(color="#245d62", width=1),
             hovertemplate="%{y}<br>Available: $%{x:,.0f}<extra></extra>"
         ))
         fig_bva.update_layout(
             **plotly_layout(barmode="stack", height=max(300, len(top_bva) * 30),
-            yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+            yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
         )
         st.plotly_chart(fig_bva, use_container_width=True)
@@ -1189,7 +1171,7 @@ with tab_budget:
                 "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
                 "% Used": "{:.1f}%", "Budget FTE": "{:,.1f}", "Actual FTE": "{:,.1f}"
             }).map(
-                lambda v: "color: #f43f5e; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
+                lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                 subset=["Available"]
             ),
             use_container_width=True, height=min(500, len(bva_display) * 35 + 60)
@@ -1305,8 +1287,8 @@ with tab_actuals:
             fig_d = go.Figure(go.Pie(
                 labels=top_donut["Name"], values=top_donut["YTD"],
                 hole=0.5, textinfo="label+percent", textposition="outside",
-                marker=dict(colors=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e", "#8b5cf6",
-                                    "#06b6d4", "#84cc16", "#ec4899", "#f97316", "#6366f1"]),
+                marker=dict(colors=["#245d62", "#c64c43", "#edc872", "#f4784e", "#1a474b",
+                                    "#5a9ea3", "#8fae5f", "#d4956a", "#b85a3a", "#7a8c6e"]),
                 hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>"
             ))
             fig_d.update_layout(**plotly_layout(height=350, showlegend=False,
@@ -1339,22 +1321,22 @@ with tab_actuals:
         fig_fb = go.Figure()
         fig_fb.add_trace(go.Bar(
             name="YTD Actuals", y=top_func["Name"], x=top_func["YTD"],
-            orientation="h", marker_color="#4f8df5",
+            orientation="h", marker_color="#245d62",
             hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
         ))
         fig_fb.add_trace(go.Bar(
             name="Encumbrance", y=top_func["Name"], x=top_func["Enc"],
-            orientation="h", marker_color="#f59e0b",
+            orientation="h", marker_color="#edc872",
             hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
         ))
         fig_fb.add_trace(go.Bar(
             name="Available", y=top_func["Name"], x=top_func["Available"].clip(lower=0),
-            orientation="h", marker_color="#1e2130", marker_line=dict(color="#4f8df5", width=1),
+            orientation="h", marker_color="#f0f0f0", marker_line=dict(color="#245d62", width=1),
             hovertemplate="%{y}<br>Available: $%{x:,.0f}<extra></extra>"
         ))
         fig_fb.update_layout(
             **plotly_layout(barmode="stack", height=max(300, len(top_func) * 32),
-            yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+            yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
         )
         st.plotly_chart(fig_fb, use_container_width=True)
@@ -1368,7 +1350,7 @@ with tab_actuals:
                 "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
                 "% Used (Act+Enc)": "{:.1f}%"
             }).map(
-                lambda v: "color: #f43f5e; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
+                lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                 subset=["Available"]
             ),
             use_container_width=True, height=min(500, len(func_m) * 35 + 60)
@@ -1517,8 +1499,8 @@ with tab_salary:
             x=comp["YTD"], y=comp["Obj_Category"], orientation="h",
             text=comp["Pct"].apply(lambda v: f"{v:.1f}%"),
             textposition="auto",
-            marker_color=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e",
-                           "#8b5cf6", "#84cc16", "#ec4899"][:len(comp)],
+            marker_color=["#245d62", "#c64c43", "#edc872", "#f4784e",
+                           "#1a474b", "#8fae5f", "#d4956a"][:len(comp)],
             hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
         ))
         fig_comp.update_layout(**plotly_layout(height=max(200, len(comp) * 40),
@@ -1577,17 +1559,17 @@ with tab_salary:
             fig_fte = go.Figure()
             fig_fte.add_trace(go.Bar(
                 name="Budget FTE", y=top_jc["JC_Name"], x=top_jc["Budget_FTE"],
-                orientation="h", marker_color="#4f8df5",
+                orientation="h", marker_color="#245d62",
                 hovertemplate="%{y}<br>Budget: %{x:,.1f} FTE<extra></extra>"
             ))
             fig_fte.add_trace(go.Bar(
                 name="Actual FTE", y=top_jc["JC_Name"], x=top_jc["Actual_FTE"],
-                orientation="h", marker_color="#2dd4bf",
+                orientation="h", marker_color="#c64c43",
                 hovertemplate="%{y}<br>Actual: %{x:,.1f} FTE<extra></extra>"
             ))
             fig_fte.update_layout(
                 **plotly_layout(barmode="group", height=max(300, len(top_jc) * 32),
-                yaxis=dict(autorange="reversed", gridcolor="#1e2130"),
+                yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
             st.plotly_chart(fig_fte, use_container_width=True)
@@ -1605,8 +1587,8 @@ with tab_salary:
                 "Avg Salary (Budget)": "${:,.0f}", "Avg Salary (Actual)": "${:,.0f}",
                 "Total Budget": "${:,.0f}", "Total YTD": "${:,.0f}"
             }).map(
-                lambda v: "color: #f43f5e" if isinstance(v, (int, float)) and v < -1
-                else ("color: #2dd4bf" if isinstance(v, (int, float)) and v > 1 else ""),
+                lambda v: "color: #c64c43" if isinstance(v, (int, float)) and v < -1
+                else ("color: #245d62" if isinstance(v, (int, float)) and v > 1 else ""),
                 subset=["FTE Variance"]
             ),
             use_container_width=True, height=min(500, len(fte_display) * 35 + 60)
@@ -1642,9 +1624,9 @@ with tab_salary:
             fig_staff = go.Figure(go.Pie(
                 labels=fc["Func_Category"], values=fc["Actual_FTE"],
                 hole=0.45, textinfo="label+percent", textposition="outside",
-                marker=dict(colors=["#4f8df5", "#2dd4bf", "#f59e0b", "#f43f5e",
-                                    "#8b5cf6", "#84cc16", "#ec4899", "#06b6d4",
-                                    "#f97316", "#6366f1"][:len(fc)]),
+                marker=dict(colors=["#245d62", "#c64c43", "#edc872", "#f4784e",
+                                    "#1a474b", "#8fae5f", "#d4956a", "#5a9ea3",
+                                    "#b85a3a", "#7a8c6e"][:len(fc)]),
                 hovertemplate="%{label}<br>FTE: %{value:,.1f}<br>%{percent}<extra></extra>"
             ))
             fig_staff.update_layout(**plotly_layout(height=350, showlegend=False,
@@ -1693,10 +1675,14 @@ with tab_salary:
                 "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
                 "% Used": "{:.1f}%"
             }).map(
-                lambda v: "color: #f43f5e; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
+                lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                 subset=["Available"]
             ),
             use_container_width=True, height=min(500, len(con_display) * 35 + 60)
         )
     else:
         st.info("No contracted services data available.")
+
+# Footer
+st.markdown("---")
+st.caption("New Mexico Public Education Department · School Budget Bureau")
