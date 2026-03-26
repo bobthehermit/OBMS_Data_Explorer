@@ -22,6 +22,8 @@ import base64
 from pathlib import Path
 from PIL import Image
 
+pd.set_option('future.no_silent_downcasting', True)
+
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="OBMS Financial Explorer",
@@ -788,7 +790,7 @@ with tab_overview:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis_tickangle=-30, yaxis_title="")
         )
-        st.plotly_chart(fig_revexp, use_container_width=True)
+        st.plotly_chart(fig_revexp, width='stretch')
 
     # ── Funds where expenditures exceed revenue ──────────────────────────
     deficit_funds = fund_merged[fund_merged["Net"] < 0].copy()
@@ -808,7 +810,7 @@ with tab_overview:
                 nr.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
                 st.dataframe(nr.style.format({
                     "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
-                }), use_container_width=True, height=min(300, len(non_reimb) * 40 + 60))
+                }), width='stretch', height=min(300, len(non_reimb) * 40 + 60))
             else:
                 st.success("No non-reimbursable fund deficits.")
 
@@ -819,7 +821,7 @@ with tab_overview:
                 r.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
                 st.dataframe(r.style.format({
                     "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
-                }), use_container_width=True, height=min(300, len(reimb) * 40 + 60))
+                }), width='stretch', height=min(300, len(reimb) * 40 + 60))
             else:
                 st.info("No reimbursable fund deficits.")
 
@@ -855,7 +857,7 @@ with tab_overview:
             }
         ))
         fig_g.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
-        st.plotly_chart(fig_g, use_container_width=True)
+        st.plotly_chart(fig_g, width='stretch')
 
     with g2:
         fig_g2 = go.Figure(go.Indicator(
@@ -873,7 +875,7 @@ with tab_overview:
             }
         ))
         fig_g2.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
-        st.plotly_chart(fig_g2, use_container_width=True)
+        st.plotly_chart(fig_g2, width='stretch')
 
     with g3:
         fig_g3 = go.Figure(go.Indicator(
@@ -892,7 +894,7 @@ with tab_overview:
             }
         ))
         fig_g3.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
-        st.plotly_chart(fig_g3, use_container_width=True)
+        st.plotly_chart(fig_g3, width='stretch')
 
     # ── Expenditure by Function (treemap) ────────────────────────────────
     st.markdown('<div class="section-header">Expenditure by Function</div>', unsafe_allow_html=True)
@@ -927,7 +929,7 @@ with tab_overview:
                 hovertemplate="%{label}<br>YTD: $%{value:,.0f}<br>% Spent: %{color:.1f}%<extra></extra>"
             ))
             fig_tree.update_layout(**plotly_layout(height=420, margin=dict(l=10, r=10, t=30, b=10)))
-            st.plotly_chart(fig_tree, use_container_width=True)
+            st.plotly_chart(fig_tree, width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -998,7 +1000,7 @@ with tab_budget:
                 yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
-            st.plotly_chart(fig_rev_bud, use_container_width=True)
+            st.plotly_chart(fig_rev_bud, width='stretch')
         else:
             st.info("No revenue budget data.")
 
@@ -1030,7 +1032,7 @@ with tab_budget:
                 yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
-            st.plotly_chart(fig_exp_bud, use_container_width=True)
+            st.plotly_chart(fig_exp_bud, width='stretch')
         else:
             st.info("No expenditure budget data.")
 
@@ -1074,7 +1076,7 @@ with tab_budget:
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 title=f"{bud_acct_label} BAR Adjustments by Fund")
             )
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width='stretch')
 
             # Detail table
             bar_detail = bars_data.groupby(["Fund", "Function"]).agg(
@@ -1093,7 +1095,7 @@ with tab_budget:
                     else ("color: #c64c43" if isinstance(v, (int, float)) and v < 0 else ""),
                     subset=["Adjustment"]
                 ),
-                use_container_width=True, height=min(500, len(bar_detail) * 35 + 60)
+                width='stretch', height=min(500, len(bar_detail) * 35 + 60)
             )
         else:
             st.info("No BAR adjustments found for current filters.")
@@ -1158,7 +1160,7 @@ with tab_budget:
             yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
         )
-        st.plotly_chart(fig_bva, use_container_width=True)
+        st.plotly_chart(fig_bva, width='stretch')
 
         # Full table
         bva_display = bva[[bva_group, "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
@@ -1174,7 +1176,7 @@ with tab_budget:
                 lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                 subset=["Available"]
             ),
-            use_container_width=True, height=min(500, len(bva_display) * 35 + 60)
+            width='stretch', height=min(500, len(bva_display) * 35 + 60)
         )
 
     # ── CSV Export ────────────────────────────────────────────────────────
@@ -1192,7 +1194,7 @@ with tab_budget:
         with bc1:
             st.markdown(f"**Expenditure Budget** — {len(exp_budget_report):,} lines")
             if len(exp_budget_report) > 0:
-                st.dataframe(exp_budget_report, use_container_width=True, height=300)
+                st.dataframe(exp_budget_report, width='stretch', height=300)
                 e1, e2 = st.columns(2)
                 with e1:
                     st.download_button(
@@ -1213,7 +1215,7 @@ with tab_budget:
         with bc2:
             st.markdown(f"**Revenue Budget** — {len(rev_budget_report):,} lines")
             if len(rev_budget_report) > 0:
-                st.dataframe(rev_budget_report, use_container_width=True, height=300)
+                st.dataframe(rev_budget_report, width='stretch', height=300)
                 r1, r2 = st.columns(2)
                 with r1:
                     st.download_button(
@@ -1293,14 +1295,14 @@ with tab_actuals:
             ))
             fig_d.update_layout(**plotly_layout(height=350, showlegend=False,
                                 margin=dict(l=10, r=10, t=10, b=10)))
-            st.plotly_chart(fig_d, use_container_width=True)
+            st.plotly_chart(fig_d, width='stretch')
 
         with sc2:
             sd = spend_data[[spend_group, "YTD", "Enc", "Pct"]].head(15).copy()
             sd.columns = [spend_group, "YTD Actuals", "Encumbrance", "% of Total"]
             st.dataframe(sd.style.format({
                 "YTD Actuals": "${:,.0f}", "Encumbrance": "${:,.0f}", "% of Total": "{:.1f}%"
-            }), use_container_width=True, height=min(400, len(sd) * 35 + 60))
+            }), width='stretch', height=min(400, len(sd) * 35 + 60))
 
     # ── Budget vs Actuals by Function ────────────────────────────────────
     st.markdown("---")
@@ -1339,7 +1341,7 @@ with tab_actuals:
             yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
         )
-        st.plotly_chart(fig_fb, use_container_width=True)
+        st.plotly_chart(fig_fb, width='stretch')
 
         st.dataframe(
             func_m[["Function", "Budget", "YTD", "Enc", "Available", "Pct_Used"]].rename(columns={
@@ -1353,7 +1355,7 @@ with tab_actuals:
                 lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                 subset=["Available"]
             ),
-            use_container_width=True, height=min(500, len(func_m) * 35 + 60)
+            width='stretch', height=min(500, len(func_m) * 35 + 60)
         )
 
     # ── CSV Exports ──────────────────────────────────────────────────────
@@ -1372,7 +1374,7 @@ with tab_actuals:
         with ac1:
             st.markdown(f"**Expenditure Actuals** — {len(exp_act_report):,} lines")
             if len(exp_act_report) > 0:
-                st.dataframe(exp_act_report, use_container_width=True, height=300)
+                st.dataframe(exp_act_report, width='stretch', height=300)
                 ae1, ae2 = st.columns(2)
                 with ae1:
                     st.download_button(
@@ -1393,7 +1395,7 @@ with tab_actuals:
         with ac2:
             st.markdown(f"**Revenue Actuals** — {len(rev_act_report):,} lines")
             if len(rev_act_report) > 0:
-                st.dataframe(rev_act_report, use_container_width=True, height=300)
+                st.dataframe(rev_act_report, width='stretch', height=300)
                 ar1, ar2 = st.columns(2)
                 with ar1:
                     st.download_button(
@@ -1505,14 +1507,14 @@ with tab_salary:
         ))
         fig_comp.update_layout(**plotly_layout(height=max(200, len(comp) * 40),
                                 yaxis=dict(autorange="reversed"), xaxis_title=""))
-        st.plotly_chart(fig_comp, use_container_width=True)
+        st.plotly_chart(fig_comp, width='stretch')
 
         st.dataframe(comp[["Obj_Category", "Budget", "YTD", "Enc", "Pct", "Pct_Used"]].rename(columns={
             "Obj_Category": "Category", "Pct": "% of Total Exp", "Pct_Used": "% of Budget Used"
         }).style.format({
             "Budget": "${:,.0f}", "YTD": "${:,.0f}", "Enc": "${:,.0f}",
             "% of Total Exp": "{:.1f}%", "% of Budget Used": "{:.1f}%"
-        }), use_container_width=True)
+        }), width='stretch')
 
     # ── FTE Analysis ─────────────────────────────────────────────────────
     st.markdown("---")
@@ -1572,7 +1574,7 @@ with tab_salary:
                 yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
-            st.plotly_chart(fig_fte, use_container_width=True)
+            st.plotly_chart(fig_fte, width='stretch')
 
         # Detail table
         fte_display = fte_jc[["Job Class", "Budget_FTE", "Actual_FTE", "FTE_Variance",
@@ -1591,7 +1593,7 @@ with tab_salary:
                 else ("color: #245d62" if isinstance(v, (int, float)) and v > 1 else ""),
                 subset=["FTE Variance"]
             ),
-            use_container_width=True, height=min(500, len(fte_display) * 35 + 60)
+            width='stretch', height=min(500, len(fte_display) * 35 + 60)
         )
 
     # ── Staffing Balance: Function Category ──────────────────────────────
@@ -1631,7 +1633,7 @@ with tab_salary:
             ))
             fig_staff.update_layout(**plotly_layout(height=350, showlegend=False,
                                      margin=dict(l=10, r=10, t=10, b=10)))
-            st.plotly_chart(fig_staff, use_container_width=True)
+            st.plotly_chart(fig_staff, width='stretch')
 
         with sc2:
             fc_display = fc[["Func_Category", "Budget_FTE", "Actual_FTE",
@@ -1642,7 +1644,7 @@ with tab_salary:
                 "Budget FTE": "{:,.1f}", "Actual FTE": "{:,.1f}",
                 "% of Total FTE": "{:.1f}%",
                 "Salary Budget": "${:,.0f}", "Salary YTD": "${:,.0f}"
-            }), use_container_width=True, height=min(400, len(fc_display) * 35 + 60))
+            }), width='stretch', height=min(400, len(fc_display) * 35 + 60))
 
     # ── Contracted Services ──────────────────────────────────────────────
     st.markdown("---")
@@ -1678,7 +1680,7 @@ with tab_salary:
                 lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                 subset=["Available"]
             ),
-            use_container_width=True, height=min(500, len(con_display) * 35 + 60)
+            width='stretch', height=min(500, len(con_display) * 35 + 60)
         )
     else:
         st.info("No contracted services data available.")
