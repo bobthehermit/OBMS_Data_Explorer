@@ -1293,13 +1293,14 @@ with tab_actuals:
             top_donut = spend_data.head(10)
             fig_d = go.Figure(go.Pie(
                 labels=top_donut["Name"], values=top_donut["YTD"],
-                hole=0.5, textinfo="label+percent", textposition="outside",
+                hole=0.35
+            , textinfo="label+percent", textposition="outside",
                 marker=dict(colors=["#245d62", "#c64c43", "#edc872", "#f4784e", "#1a474b",
                                     "#5a9ea3", "#8fae5f", "#d4956a", "#b85a3a", "#7a8c6e"]),
                 hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>"
             ))
-            fig_d.update_layout(**plotly_layout(height=350, showlegend=False,
-                                margin=dict(l=10, r=10, t=10, b=10)))
+            fig_d.update_layout(**plotly_layout(height=400, showlegend=False,
+                                margin=dict(l=120, r=120, t=30, b=30)))
             st.plotly_chart(fig_d, use_container_width=True)
 
         with sc2:
@@ -1630,14 +1631,14 @@ with tab_salary:
         with sc1:
             fig_staff = go.Figure(go.Pie(
                 labels=fc["Func_Category"], values=fc["Actual_FTE"],
-                hole=0.45, textinfo="label+percent", textposition="outside",
+                hole=0.35, textinfo="label+percent", textposition="outside",
                 marker=dict(colors=["#245d62", "#c64c43", "#edc872", "#f4784e",
                                     "#1a474b", "#8fae5f", "#d4956a", "#5a9ea3",
                                     "#b85a3a", "#7a8c6e"][:len(fc)]),
                 hovertemplate="%{label}<br>FTE: %{value:,.1f}<br>%{percent}<extra></extra>"
             ))
-            fig_staff.update_layout(**plotly_layout(height=350, showlegend=False,
-                                     margin=dict(l=10, r=10, t=10, b=10)))
+            fig_staff.update_layout(**plotly_layout(height=400, showlegend=False,
+                                     margin=dict(l=120, r=120, t=30, b=30)))
             st.plotly_chart(fig_staff, use_container_width=True)
 
         with sc2:
