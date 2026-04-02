@@ -21,10 +21,6 @@ import numpy as np
 import base64
 from pathlib import Path
 from PIL import Image
-import gdown
-import tempfile
-
-pd.set_option('future.no_silent_downcasting', True)
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -238,10 +234,7 @@ def load_single_parquet(file_key: str) -> pd.DataFrame:
     if not file_id:
         return pd.DataFrame()
     try:
-        url = f"https://drive.google.com/uc?id={file_id}"
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-            gdown.download(url, tmp.name, quiet=True)
-            return pd.read_parquet(tmp.name)
+        return pd.read_parquet(gdrive_download_url(file_id))
     except Exception as e:
         st.warning(f"Failed to load {file_key}: {e}")
         return pd.DataFrame()
@@ -1001,7 +994,7 @@ with tab_budget:
                 hovertemplate="%{y}<br>Adjustments: $%{x:,.0f}<extra></extra>"
             ))
             fig_rev_bud.update_layout(
-                **plotly_layout(barmode="stack", height=350,
+                **plotly_layout(barmode="stack", height=400,
                 yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
@@ -1033,7 +1026,7 @@ with tab_budget:
                 hovertemplate="%{y}<br>Adjustments: $%{x:,.0f}<extra></extra>"
             ))
             fig_exp_bud.update_layout(
-                **plotly_layout(barmode="stack", height=350,
+                **plotly_layout(barmode="stack", height=400,
                 yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
@@ -1293,14 +1286,13 @@ with tab_actuals:
             top_donut = spend_data.head(10)
             fig_d = go.Figure(go.Pie(
                 labels=top_donut["Name"], values=top_donut["YTD"],
-                hole=0.35
-            , textinfo="label+percent", textposition="outside",
+                hole=0.35, textinfo="label+percent", textposition="outside",
                 marker=dict(colors=["#245d62", "#c64c43", "#edc872", "#f4784e", "#1a474b",
                                     "#5a9ea3", "#8fae5f", "#d4956a", "#b85a3a", "#7a8c6e"]),
                 hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>"
             ))
             fig_d.update_layout(**plotly_layout(height=400, showlegend=False,
-                                margin=dict(l=120, r=120, t=30, b=30)))
+                                margin=dict(l=120, r=120, t=10, b=30)))
             st.plotly_chart(fig_d, use_container_width=True)
 
         with sc2:
