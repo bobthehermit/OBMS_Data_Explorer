@@ -577,12 +577,12 @@ with st.sidebar:
     st.markdown("---")
 
     fy_options = sorted(ALL_FY_KEYS, reverse=True)
-    selected_fy = st.multiselect(
+    selected_fy = [st.selectbox(
         "Fiscal Year",
         options=fy_options,
-        default=[fy_options[0]] if fy_options else [],
+        index=0,
         format_func=lambda x: FY_LABELS.get(x, str(x))
-    )
+    )]
 
 if not selected_fy:
     st.warning("Select at least one fiscal year.")
