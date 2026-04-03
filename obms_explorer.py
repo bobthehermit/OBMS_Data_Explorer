@@ -547,9 +547,9 @@ def classify_function_category(func_str):
         return "Other"
 
 def main():
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR: Global Filters (Entity + FY + Period)
-# ══════════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════════
+    # SIDEBAR: Global Filters (Entity + FY + Period)
+    # ══════════════════════════════════════════════════════════════════════════════
     with st.sidebar:
         # ── Logo ──────────────────────────────────────────────────────────────
         LOGO_PATH = Path(__file__).parent / "300 DPI NM PED Logo JPEG.jpg"
@@ -625,7 +625,8 @@ def main():
         act_count = len(act_raw)
         bud_count = len(bud_raw)
         st.caption(f"📁 {act_count:,} actuals · {bud_count:,} budget rows · {len(selected_fy)} FY(s)")
-        st.caption(f"☁️ Data source: Google Drive parquet files")
+        st.caption(f"☁️ Data source: OBMS")
+        st.caption(f"🕰️ Loaded: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
 
 
     # ── Apply global entity filter to raw data ───────────────────────────────────
