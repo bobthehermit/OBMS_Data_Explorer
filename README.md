@@ -1,3 +1,43 @@
+---
+
+title: OBMS Financial Explorer
+
+emoji: 📊
+
+colorFrom: green
+
+colorTo: yellow
+
+sdk: streamlit
+
+sdk_version: "1.44.0"
+
+app_file: obms_explorer.py
+
+pinned: false
+
+license: mit
+
+---
+
+# OBMS Financial Explorer
+
+**NM Public Education Department · School Budget Bureau**
+
+Interactive financial data explorer for New Mexico school districts and charter schools.
+
+Reads parquet data extracted from OBMS SSAS cubes via XMLA.
+
+**Tabs:**
+
+1. **Overview** – Executive snapshot per entity
+
+2. **Budget Authority** – Revenue & expenditure budget detail, BAR analysis, CSV export
+
+3. **Actuals** – Quarterly actuals with full OBMS string, CSV export
+
+4. **Salary & Benefits** – FTE analysis, job class breakdown, contracted services
+
 # OBMS Financial Explorer
 
 A Streamlit-based financial analysis platform for the New Mexico Public Education Department's School Budget Bureau. Provides interactive budget authority tracking, actuals reporting, and salary/FTE analytics for 216+ school districts and charter schools — powered by OBMS data extracted from SSAS cubes via XMLA.
