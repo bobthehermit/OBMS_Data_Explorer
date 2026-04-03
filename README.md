@@ -38,8 +38,6 @@ Reads parquet data extracted from OBMS SSAS cubes via XMLA.
 
 4. **Salary & Benefits** – FTE analysis, job class breakdown, contracted services
 
-# OBMS Financial Explorer
-
 A Streamlit-based financial analysis platform for the New Mexico Public Education Department's School Budget Bureau. Provides interactive budget authority tracking, actuals reporting, and salary/FTE analytics for 216+ school districts and charter schools — powered by OBMS data extracted from SSAS cubes via XMLA.
 
 ## Overview
@@ -120,7 +118,10 @@ streamlit run obms_explorer.py
 
 ### Deployment
 
-Designed for Streamlit Community Cloud via GitHub. Parquet files must be publicly shared on Google Drive (view access).
+Deployed on Hugging Face Spaces via GitHub sync. Any push to the `main` 
+branch on GitHub automatically redeploys the app.
+
+Parquet files must be publicly shared on Google Drive (view access).
 
 To add a new fiscal year:
 1. Upload the actuals and budget parquet files to Google Drive
@@ -137,4 +138,4 @@ To add a new fiscal year:
 
 ## Author
 
-School Budget Bureau, New Mexico Public Education Department
+Lorenzo Dominguez, School Budget Bureau, New Mexico Public Education Department
