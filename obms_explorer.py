@@ -718,15 +718,24 @@ def main():
 
 
     # ── Tabs ─────────────────────────────────────────────────────────────────────
-    tab_overview, tab_budget, tab_actuals, tab_salary = st.tabs([
-        "📊 Overview", "📋 Budget Authority", "📈 Actuals", "👥 Salary & Benefits"
-    ])
+    TAB_NAMES = ["📊 Overview", "📋 Budget Authority", "📈 Actuals", "👥 Salary & Benefits"]
 
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = TAB_NAMES[0]
+
+    selected_tab = st.radio(
+        "Navigation",
+        options=TAB_NAMES,
+        index=TAB_NAMES.index(st.session_state.active_tab),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_tab"
+    )
 
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 1: OVERVIEW
     # ══════════════════════════════════════════════════════════════════════════════
-    with tab_overview:
+    if st.session_state.active_tab == "📊 Overview":
 
         # Revenue side totals
         rev_bud = bud_global[bud_global["Account Type"] == "R"] if len(bud_global) > 0 else pd.DataFrame()
@@ -934,7 +943,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 2: BUDGET AUTHORITY
     # ══════════════════════════════════════════════════════════════════════════════
-    with tab_budget:
+    elif st.session_state.active_tab == "📋 Budget Authority":
 
         st.markdown('<div class="section-header">Budget Authority Analysis</div>', unsafe_allow_html=True)
 
@@ -1238,7 +1247,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 3: ACTUALS
     # ══════════════════════════════════════════════════════════════════════════════
-    with tab_actuals:
+    elif st.session_state.active_tab == "📈 Actuals":
 
         st.markdown('<div class="section-header">Actuals Analysis & Export</div>', unsafe_allow_html=True)
 
@@ -1418,7 +1427,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 4: SALARY & BENEFITS
     # ══════════════════════════════════════════════════════════════════════════════
-    with tab_salary:
+    elif st.session_state.active_tab == "👥 Salary & Benefits":
 
         st.markdown('<div class="section-header">Salary & Benefits Analysis</div>', unsafe_allow_html=True)
 
