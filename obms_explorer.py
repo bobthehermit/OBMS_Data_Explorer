@@ -208,6 +208,7 @@ GDRIVE_FILES = {
     "budget_2324": "1S0Ru87FcSenACF2_MARn0aqLpfdFfGYM",
     "budget_2425": "19G--IZmrAH2qkmwZlGm4Lm598Ee0MMsH",
     "budget_2526": "1Wt1vuIJCn16r5vZA_NKPSaxfsvKu10mN",
+    "budget_2627": "1OjhZtjAmPRM36Jua1SMeJygYBN_YX4g4",
 }
 
 
@@ -406,12 +407,12 @@ def build_actuals_report(act_df, bud_df, entity_name, account_type):
     act = act_df[
         (act_df["Budget Entity"] == entity_name) &
         (act_df["Account Type"] == account_type)
-    ].copy()
+    ].copy() if len(act_df) > 0 else act_df.copy()
 
     bud = bud_df[
         (bud_df["Budget Entity"] == entity_name) &
         (bud_df["Account Type"] == account_type)
-    ].copy()
+    ].copy() if len(bud_df) > 0 else bud_df.copy()
 
     if len(act) == 0 and len(bud) == 0:
         return pd.DataFrame(columns=ACTUALS_CSV_COLS)
@@ -631,8 +632,8 @@ def main():
 
     # ── Apply global entity filter to raw data ───────────────────────────────────
     if selected_entity != "— All Entities —":
-        act_global = act_raw[act_raw["Budget Entity"] == selected_entity].copy()
-        bud_global = bud_raw[bud_raw["Budget Entity"] == selected_entity].copy()
+        act_global = act_raw[act_raw["Budget Entity"] == selected_entity].copy() if len(act_raw) > 0 else act_raw.copy()
+        bud_global = bud_raw[bud_raw["Budget Entity"] == selected_entity].copy() if len(bud_raw) > 0 else bud_raw.copy()
     else:
         act_global = act_raw.copy()
         bud_global = bud_raw.copy()
