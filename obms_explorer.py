@@ -8,6 +8,13 @@ Tabs:
   2. Budget Authority – Revenue & expenditure budget detail, BAR analysis, CSV export
   3. Actuals          – Quarterly actuals with full OBMS string (incl. Location), CSV export
   4. Salary & Benefits – FTE analysis, job class breakdown, contracted services
+
+Design pass (Jul 2026): restyled to match the Contacts app's "institutional
+  clarity" language — teal as the structural accent, gold as hairline
+  dividers, coral reserved for alert states, light-yellow panels retired,
+  de-emojified labels, serif masthead. Logic unchanged, with one exception:
+  the tab radio no longer passes both `index=` and `key=` (which triggers a
+  Streamlit session-state warning); the widget key alone now carries state.
 """
 
 import streamlit as st
@@ -29,32 +36,70 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ── Brand CSS (NMPED palette) ────────────────────────────────────────────────
+# ── Brand CSS (NMPED palette — institutional-clarity pass) ──────────────────
 # PED brand palette
-#   Primary teal:  #245d62   Dark teal: #1a474b
-#   Coral red:     #c64c43   Orange:    #f4784e
-#   Gold:          #edc872   Lt yellow: #fef0c3
+#   Primary teal: #245d62   Dark teal: #1a474b
+#   Gold:         #edc872   Coral:     #c64c43 (reserved strictly for alerts)
+#   (Light yellow #fef0c3 intentionally retired from panels — matches
+#    Contacts app. Kept full-width layout rather than the Contacts app's
+#    1180px max-width: dense tables and charts here earn the horizontal room.)
 st.markdown("""
 <style>
 /* Layout */
-.block-container { padding-top: .8rem !important; }
-
-/* Metrics */
-.stMetric {
-    background: #fef0c3; padding: 14px; border-radius: 6px;
-    border-left: 4px solid #245d62;
-}
-.stMetric label { color: #245d62 !important; font-weight: 600; font-size: .85rem; }
-.stMetric [data-testid="stMetricValue"] {
-    color: #245d62 !important; font-weight: 700; font-size: 1.7rem;
-}
+.block-container { padding-top: 1.1rem !important; }
 
 /* Headings */
-h1, h2, h3 { color: #245d62; }
+h1, h2, h3, h4 { color: #245d62; font-weight: 600; }
+
+/* Custom masthead */
+.ped-eyebrow {
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    color: #7a8a86; font-weight: 600;
+}
+.ped-title {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 2rem; color: #245d62; font-weight: 600;
+    margin: .15rem 0 .35rem; line-height: 1.1;
+}
+.ped-context { font-size: 13px; color: #8a8a82; margin-bottom: .55rem; }
+.ped-rule { display: flex; height: 3px; margin-bottom: 1.1rem; }
+.ped-rule .g { width: 46px; background: #edc872; }
+.ped-rule .t { flex: 1; background: #245d62; }
+
+/* Metrics — white card with hairline border (yellow panel retired) */
+.stMetric, [data-testid="stMetric"] {
+    background: #ffffff; padding: 13px 15px; border-radius: 8px;
+    border: 0.5px solid #e3e3dd;
+}
+.stMetric label, [data-testid="stMetric"] label {
+    color: #8a8a82 !important; font-weight: 600; font-size: 11px;
+    letter-spacing: .06em; text-transform: uppercase;
+}
+.stMetric [data-testid="stMetricValue"],
+[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    color: #245d62 !important; font-weight: 600; font-size: 1.7rem;
+}
+
+/* Section header — uppercase label over gold hairline */
+.section-header {
+    font-weight: 600;
+    font-size: 11px;
+    color: #245d62;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin: 1.5rem 0 0.8rem 0;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #edc872;
+    display: inline-block;
+}
+
+/* Links — teal, not coral (coral is reserved for alerts) */
+a { color: #245d62; text-decoration: none; }
+a:hover { color: #1a474b; text-decoration: underline; }
 
 /* Download buttons */
 .stDownloadButton button {
-    width: 100%; background: #245d62; color: #fff !important;
+    width: 100%; background: #245d62; color: #fff !important; border: none;
 }
 .stDownloadButton button:hover { background: #1a474b; }
 .stDownloadButton button p,
@@ -69,42 +114,10 @@ h1, h2, h3 { color: #245d62; }
 [data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] span { color: #fff !important; }
 [data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] svg  { fill: #fff !important; }
 
-/* Links */
-a { color: #c64c43; text-decoration: none; }
-a:hover { color: #a03d35; text-decoration: underline; }
-
-/* Section header */
-.section-header {
-    font-weight: 700;
-    font-size: 1.1rem;
-    color: #245d62;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin: 1.5rem 0 0.8rem 0;
-    padding-bottom: 0.4rem;
-    border-bottom: 2px solid #245d62;
-    display: inline-block;
-}
-
-/* App title in sidebar */
-.app-title {
-    font-weight: 700;
-    font-size: 1.6rem;
-    color: #245d62;
-    margin-bottom: 0;
-    line-height: 1.2;
-}
-.app-subtitle {
-    font-size: 0.78rem;
-    color: #666;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    margin-top: 2px;
-}
-
-/* Expander details */
+/* Expander — lighter frame (gold frame retired) */
+[data-testid="stExpander"] { border: 0.5px solid #ececec; border-radius: 8px; }
 details {
-    border: 1px solid #edc872 !important;
+    border: 0.5px solid #ececec !important;
     border-radius: 8px !important;
 }
 
@@ -119,7 +132,7 @@ button[data-baseweb="tab"] {
 
 # ── Plotly Theme (NMPED brand – light mode) ─────────────────────────────────
 _PLOTLY_BASE = dict(
-    font=dict(family="sans-serif", color="#333333"),
+    font=dict(family="sans-serif", color="#1a1a1a"),
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
     colorway=["#245d62", "#c64c43", "#edc872", "#f4784e", "#1a474b",
@@ -127,7 +140,7 @@ _PLOTLY_BASE = dict(
     hoverlabel=dict(
         bgcolor="#ffffff",
         bordercolor="#245d62",
-        font=dict(family="sans-serif", color="#333333", size=13)
+        font=dict(family="sans-serif", color="#1a1a1a", size=13)
     ),
 )
 
@@ -625,9 +638,9 @@ def main():
         st.markdown("---")
         act_count = len(act_raw)
         bud_count = len(bud_raw)
-        st.caption(f"📁 {act_count:,} actuals · {bud_count:,} budget rows · {len(selected_fy)} FY(s)")
-        st.caption(f"☁️ Data source: OBMS")
-        st.caption(f"🕰️ Loaded: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        st.caption(f"{act_count:,} actuals · {bud_count:,} budget rows · {len(selected_fy)} FY(s)")
+        st.caption("Data source: OBMS")
+        st.caption(f"Loaded: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
 
 
     # ── Apply global entity filter to raw data ───────────────────────────────────
@@ -686,7 +699,7 @@ def main():
                         filters[dim] = selected
                 col_idx += 1
         else:
-            with st.expander("🔍 Dimension Filters", expanded=False):
+            with st.expander("Dimension Filters", expanded=False):
                 fcols = st.columns(3)
                 for i, dim in enumerate(dims):
                     with fcols[i % 3]:
@@ -707,27 +720,25 @@ def main():
         return a, b, acct_type
 
 
-    # ── Header ───────────────────────────────────────────────────────────────────
+    # ── Masthead ─────────────────────────────────────────────────────────────────
     st.markdown(f"""
-    <div style="margin-bottom: 0.5rem;">
-        <span class="app-title" style="font-size: 1.3rem;">OBMS Financial Explorer</span>
-        <span style="color: #666; font-size: 0.85rem; margin-left: 12px;">
-            {entity_label} · {fy_label} · {period_label}
-        </span>
-    </div>
+    <div class="ped-eyebrow">New Mexico PED · School Budget Bureau</div>
+    <div class="ped-title">OBMS Financial Explorer</div>
+    <div class="ped-context">{entity_label} · {fy_label} · {period_label}</div>
+    <div class="ped-rule"><span class="g"></span><span class="t"></span></div>
     """, unsafe_allow_html=True)
 
 
     # ── Tabs ─────────────────────────────────────────────────────────────────────
-    TAB_NAMES = ["📊 Overview", "📋 Budget Authority", "📈 Actuals", "👥 Salary & Benefits"]
+    TAB_NAMES = ["Overview", "Budget Authority", "Actuals", "Salary & Benefits"]
 
-    if "active_tab" not in st.session_state:
-        st.session_state.active_tab = TAB_NAMES[0]
-
+    # NOTE: state lives in the widget key alone. Passing both `index=` (from
+    # session state) and `key="active_tab"` triggers Streamlit's "widget
+    # created with a default value but also had its value set via Session
+    # State" warning and can misbehave across versions.
     selected_tab = st.radio(
         "Navigation",
         options=TAB_NAMES,
-        index=TAB_NAMES.index(st.session_state.active_tab),
         horizontal=True,
         label_visibility="collapsed",
         key="active_tab"
@@ -736,7 +747,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 1: OVERVIEW
     # ══════════════════════════════════════════════════════════════════════════════
-    if st.session_state.active_tab == "📊 Overview":
+    if st.session_state.active_tab == "Overview":
 
         # Revenue side totals
         rev_bud = bud_global[bud_global["Account Type"] == "R"] if len(bud_global) > 0 else pd.DataFrame()
@@ -853,14 +864,14 @@ def main():
             fig_g = go.Figure(go.Indicator(
                 mode="gauge+number+delta",
                 value=exp_pct_spent,
-                number={"suffix": "%", "font": {"size": 36, "family": "JetBrains Mono"}},
+                number={"suffix": "%", "font": {"size": 36}},
                 delta={"reference": expected_pct, "suffix": "%", "relative": False},
                 title={"text": "Exp. % Spent vs Expected", "font": {"size": 14}},
                 gauge={
                     "axis": {"range": [0, 100], "ticksuffix": "%"},
-                    "bar": {"color": "#245d62"}, "bgcolor": "#fef0c3",
-                    "steps": [{"range": [0, expected_pct], "color": "#f5f5f5"},
-                            {"range": [expected_pct, 100], "color": "#1a1a2e"}],
+                    "bar": {"color": "#245d62"}, "bgcolor": "#f4f3ef",
+                    "steps": [{"range": [0, expected_pct], "color": "#ffffff"},
+                            {"range": [expected_pct, 100], "color": "#e3e3dd"}],
                     "threshold": {"line": {"color": "#edc872", "width": 3},
                                 "thickness": 0.8, "value": expected_pct}
                 }
@@ -872,14 +883,14 @@ def main():
             fig_g2 = go.Figure(go.Indicator(
                 mode="gauge+number",
                 value=exp_pct_committed,
-                number={"suffix": "%", "font": {"size": 36, "family": "JetBrains Mono"}},
+                number={"suffix": "%", "font": {"size": 36}},
                 title={"text": "Exp. % Committed (YTD + Enc)", "font": {"size": 14}},
                 gauge={
                     "axis": {"range": [0, 120], "ticksuffix": "%"},
-                    "bar": {"color": "#c64c43"}, "bgcolor": "#fef0c3",
-                    "steps": [{"range": [0, 100], "color": "#f5f5f5"},
-                            {"range": [100, 120], "color": "#3d1515"}],
-                    "threshold": {"line": {"color": "#f4784e", "width": 3},
+                    "bar": {"color": "#1a474b"}, "bgcolor": "#f4f3ef",
+                    "steps": [{"range": [0, 100], "color": "#ffffff"},
+                            {"range": [100, 120], "color": "#faece7"}],
+                    "threshold": {"line": {"color": "#c64c43", "width": 3},
                                 "thickness": 0.8, "value": 100}
                 }
             ))
@@ -890,14 +901,14 @@ def main():
             fig_g3 = go.Figure(go.Indicator(
                 mode="gauge+number+delta",
                 value=rev_pct_collected,
-                number={"suffix": "%", "font": {"size": 36, "family": "JetBrains Mono"}},
+                number={"suffix": "%", "font": {"size": 36}},
                 delta={"reference": expected_pct, "suffix": "%", "relative": False},
                 title={"text": "Revenue % Collected vs Expected", "font": {"size": 14}},
                 gauge={
                     "axis": {"range": [0, 120], "ticksuffix": "%"},
-                    "bar": {"color": "#8fae5f"}, "bgcolor": "#fef0c3",
-                    "steps": [{"range": [0, expected_pct], "color": "#f5f5f5"},
-                            {"range": [expected_pct, 120], "color": "#1a1a2e"}],
+                    "bar": {"color": "#8fae5f"}, "bgcolor": "#f4f3ef",
+                    "steps": [{"range": [0, expected_pct], "color": "#ffffff"},
+                            {"range": [expected_pct, 120], "color": "#e3e3dd"}],
                     "threshold": {"line": {"color": "#edc872", "width": 3},
                                 "thickness": 0.8, "value": expected_pct}
                 }
@@ -944,7 +955,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 2: BUDGET AUTHORITY
     # ══════════════════════════════════════════════════════════════════════════════
-    elif st.session_state.active_tab == "📋 Budget Authority":
+    elif st.session_state.active_tab == "Budget Authority":
 
         st.markdown('<div class="section-header">Budget Authority Analysis</div>', unsafe_allow_html=True)
 
@@ -1144,7 +1155,7 @@ def main():
             # Flag lines exceeding budget authority
             exceeding = bva[bva["Available"] < 0]
             if len(exceeding) > 0:
-                st.warning(f"⚠️ {len(exceeding)} {bva_group.lower()}(s) have expenditures + encumbrances exceeding budget authority.")
+                st.warning(f"{len(exceeding)} {bva_group.lower()}(s) have expenditures + encumbrances exceeding budget authority.")
 
             # Stacked horizontal bar
             top_bva = bva[bva["Adjusted_Budget"] > 0].head(15)
@@ -1207,14 +1218,14 @@ def main():
                     e1, e2 = st.columns(2)
                     with e1:
                         st.download_button(
-                            "📥 Exp Budget CSV",
+                            "Exp Budget CSV",
                             data=exp_budget_report.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_exp_budget.csv",
                             mime="text/csv", key="dl_bud_exp_csv"
                         )
                     with e2:
                         st.download_button(
-                            "📥 Exp Budget Excel",
+                            "Exp Budget Excel",
                             data=to_excel_download(exp_budget_report, "Exp Budget"),
                             file_name=f"{entity_short}_fy{fy_code}_exp_budget.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1228,14 +1239,14 @@ def main():
                     r1, r2 = st.columns(2)
                     with r1:
                         st.download_button(
-                            "📥 Rev Budget CSV",
+                            "Rev Budget CSV",
                             data=rev_budget_report.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_rev_budget.csv",
                             mime="text/csv", key="dl_bud_rev_csv"
                         )
                     with r2:
                         st.download_button(
-                            "📥 Rev Budget Excel",
+                            "Rev Budget Excel",
                             data=to_excel_download(rev_budget_report, "Rev Budget"),
                             file_name=f"{entity_short}_fy{fy_code}_rev_budget.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1248,7 +1259,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 3: ACTUALS
     # ══════════════════════════════════════════════════════════════════════════════
-    elif st.session_state.active_tab == "📈 Actuals":
+    elif st.session_state.active_tab == "Actuals":
 
         st.markdown('<div class="section-header">Actuals Analysis & Export</div>', unsafe_allow_html=True)
 
@@ -1387,14 +1398,14 @@ def main():
                     ae1, ae2 = st.columns(2)
                     with ae1:
                         st.download_button(
-                            "📥 Exp Actuals CSV",
+                            "Exp Actuals CSV",
                             data=exp_act_report.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_exp.csv",
                             mime="text/csv", key="dl_act_exp_csv"
                         )
                     with ae2:
                         st.download_button(
-                            "📥 Exp Actuals Excel",
+                            "Exp Actuals Excel",
                             data=to_excel_download(exp_act_report, "Expenditures"),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_exp.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1408,14 +1419,14 @@ def main():
                     ar1, ar2 = st.columns(2)
                     with ar1:
                         st.download_button(
-                            "📥 Rev Actuals CSV",
+                            "Rev Actuals CSV",
                             data=rev_act_report.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_rev.csv",
                             mime="text/csv", key="dl_act_rev_csv"
                         )
                     with ar2:
                         st.download_button(
-                            "📥 Rev Actuals Excel",
+                            "Rev Actuals Excel",
                             data=to_excel_download(rev_act_report, "Revenue"),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_rev.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1428,7 +1439,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 4: SALARY & BENEFITS
     # ══════════════════════════════════════════════════════════════════════════════
-    elif st.session_state.active_tab == "👥 Salary & Benefits":
+    elif st.session_state.active_tab == "Salary & Benefits":
 
         st.markdown('<div class="section-header">Salary & Benefits Analysis</div>', unsafe_allow_html=True)
 
@@ -1445,7 +1456,7 @@ def main():
             sal_bud["Func_Category"] = sal_bud["Function"].apply(classify_function_category)
 
         # Tab-level filters (Fund, Function, Location)
-        with st.expander("🔍 Filters", expanded=False):
+        with st.expander("Filters", expanded=False):
             sf1, sf2, sf3 = st.columns(3)
             with sf1:
                 sal_funds = st.multiselect("Fund", get_unique_values(sal_act, sal_bud, "Fund"),
