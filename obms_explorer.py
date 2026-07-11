@@ -39,6 +39,14 @@ Under-the-hood pass (Jul 2026): performance + maintainability. Analytics
   - Budget-vs-actuals aggregation is factored into budget_vs_actuals(),
     shared by the Budget Authority and Actuals tabs so the over-authority
     flag logic can't drift between them.
+
+Report Builder (Jul 2026): new tab. Compose a report from any combination
+  of row dimensions (including Budget Entity, for statewide comparisons)
+  and measures from both the budget and actuals sides, with derived
+  Available Balance and Burn %. Optional totals row, raw/formatted export,
+  and named report definitions persisted to report_definitions.json next
+  to this file (commit the JSON to ship saved reports to HF Spaces —
+  runtime writes there are ephemeral across rebuilds).
 """
 
 import streamlit as st
@@ -493,6 +501,142 @@ def budget_vs_actuals(bud_df: pd.DataFrame, act_df: pd.DataFrame,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# REPORT BUILDER CORE
+# ══════════════════════════════════════════════════════════════════════════════
+REPORT_DIM_OPTIONS = ["Budget Entity"] + FILTER_DIMS
+
+# label: (side, source column, format kind)
+MEASURE_SPECS = {
+    "Beginning Budget":   ("bud", "Final Amt", "money"),
+    "BAR Adjustments":    ("bud", "Adjustment Amt", "money"),
+    "Adjusted Budget":    ("bud", "Adjusted Amt", "money"),
+    "Beginning FTE":      ("bud", "Final FTE", "fte"),
+    "Adjustment FTE":     ("bud", "Adjustment FTE", "fte"),
+    "Adjusted FTE":       ("bud", "Adjusted FTE", "fte"),
+    "Period Actuals":     ("act", "Actuals Period Amount", "money"),
+    "YTD Actuals":        ("act", "Actuals YTDAmount", "money"),
+    "Encumbrance":        ("act", "Actuals Encumbrance", "money"),
+    "Actuals FTE":        ("act", "Actuals FTE", "fte"),
+    "Available Balance":  ("derived", None, "money"),
+    "Burn % (Act + Enc)": ("derived", None, "pct"),
+}
+
+
+def build_custom_report(act_df, bud_df, dims, measures, raw=False, totals=False):
+    """
+    Group both sides by `dims` (in order), outer-merge, and emit `measures`
+    (in order). Derived measures (Available Balance, Burn %) pull their
+    dependencies internally even when those aren't selected for display.
+    Empty sides (e.g., no actuals submitted for the period) yield blank
+    cells, same semantics as build_actuals_report.
+    """
+    dims = [d for d in dims if d in REPORT_DIM_OPTIONS]
+    measures = [m for m in measures if m in MEASURE_SPECS]
+    if not dims or not measures:
+        return pd.DataFrame(columns=dims + measures)
+
+    need_derived = any(MEASURE_SPECS[m][0] == "derived" for m in measures)
+    bud_map = {m: MEASURE_SPECS[m][1] for m in measures if MEASURE_SPECS[m][0] == "bud"}
+    act_map = {m: MEASURE_SPECS[m][1] for m in measures if MEASURE_SPECS[m][0] == "act"}
+    if need_derived:
+        bud_map.setdefault("Adjusted Budget", "Adjusted Amt")
+        act_map.setdefault("YTD Actuals", "Actuals YTDAmount")
+        act_map.setdefault("Encumbrance", "Actuals Encumbrance")
+
+    def _agg(df, colmap):
+        if not colmap:
+            return None
+        # Empty/column-less side → placeholder; to_numeric below fixes dtypes.
+        if len(df) == 0 or any(d not in df.columns for d in dims) \
+           or any(src not in df.columns for src in colmap.values()):
+            return pd.DataFrame(columns=dims + list(colmap))
+        return df.groupby(dims, dropna=False, observed=True).agg(
+            **{out: (src, "sum") for out, src in colmap.items()}
+        ).reset_index()
+
+    b = _agg(bud_df, bud_map)
+    a = _agg(act_df, act_map)
+
+    if b is not None and a is not None:
+        out = b.merge(a, on=dims, how="outer")
+    else:
+        out = (b if b is not None else a).copy()
+
+    for col in list(bud_map) + list(act_map):
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    if need_derived:
+        out["Available Balance"] = (
+            out["Adjusted Budget"].fillna(0)
+            - out["YTD Actuals"].fillna(0)
+            - out["Encumbrance"].fillna(0)
+        )
+        denom = out["Adjusted Budget"].replace(0, np.nan)
+        out["Burn % (Act + Enc)"] = (
+            (out["YTD Actuals"].fillna(0) + out["Encumbrance"].fillna(0)) / denom * 100
+        )
+
+    out = out.sort_values(dims).reset_index(drop=True)
+
+    # Totals computed from the internal numeric frame (Burn % recomputed
+    # from summed components, never summed as a percentage).
+    tot_row = None
+    if totals and len(out) > 0:
+        tot_row = {d: "" for d in dims}
+        tot_row[dims[0]] = "TOTAL"
+        for m in measures:
+            if m == "Burn % (Act + Enc)":
+                ab = out["Adjusted Budget"].sum(skipna=True)
+                ye = out["YTD Actuals"].fillna(0).sum() + out["Encumbrance"].fillna(0).sum()
+                tot_row[m] = (ye / ab * 100) if ab else np.nan
+            else:
+                tot_row[m] = out[m].sum(skipna=True)
+
+    out = out[dims + measures]
+    if tot_row is not None:
+        out = pd.concat([out, pd.DataFrame([tot_row])], ignore_index=True)
+
+    if raw:
+        return out
+
+    for m in measures:
+        kind = MEASURE_SPECS[m][2]
+        if kind == "money":
+            out[m] = out[m].apply(lambda v: "" if pd.isna(v) else fmt_acct_currency(v))
+        elif kind == "fte":
+            out[m] = out[m].apply(lambda v: "" if pd.isna(v) else f"{float(v):.2f}")
+        else:  # pct
+            out[m] = out[m].apply(lambda v: "" if pd.isna(v) else f"{float(v):.2f}%")
+    return out
+
+
+# ── Saved report definitions (report_definitions.json next to this file) ────
+# Persist fine locally; on HF Spaces runtime writes survive only until the
+# next rebuild — commit the JSON to ship definitions with the app.
+_REPORT_DEFS_PATH = Path(__file__).parent / "report_definitions.json"
+
+
+def _load_report_defs() -> dict:
+    try:
+        if _REPORT_DEFS_PATH.exists():
+            with open(_REPORT_DEFS_PATH) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_report_defs(defs: dict) -> None:
+    try:
+        with open(_REPORT_DEFS_PATH, "w") as f:
+            json.dump(defs, f, indent=2)
+    except Exception as e:
+        st.warning(f"Could not save report definitions: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BUDGET AUTHORITY REPORT BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 BUDGET_CSV_COLS = [
@@ -859,7 +1003,6 @@ def main():
                     "Account Type",
                     options=["E", "R"],
                     format_func=lambda x: "Expenditure" if x == "E" else "Revenue",
-                    index=0,
                     horizontal=True,
                     key=f"{tab_key}_acct_type"
                 )
@@ -906,7 +1049,7 @@ def main():
 
 
     # ── Tabs ─────────────────────────────────────────────────────────────────────
-    TAB_NAMES = ["Overview", "Budget Authority", "Actuals", "Salary & Benefits"]
+    TAB_NAMES = ["Overview", "Budget Authority", "Actuals", "Report Builder", "Salary & Benefits"]
 
     # NOTE: state lives in the widget key alone. Passing both `index=` (from
     # session state) and `key="active_tab"` triggers Streamlit's "widget
@@ -1599,7 +1742,137 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 4: SALARY & BENEFITS
+    # TAB 4: REPORT BUILDER
+    # ══════════════════════════════════════════════════════════════════════════════
+    elif st.session_state.active_tab == "Report Builder":
+
+        st.markdown('<div class="section-header">Custom Report Builder</div>', unsafe_allow_html=True)
+        st.caption(
+            "Compose a report from any combination of row dimensions and measures, "
+            "scoped by the sidebar (entity · fiscal year · period) and the filters "
+            "below. Group by Budget Entity with '— All Entities —' selected for "
+            "statewide comparisons."
+        )
+
+        # ── Saved definitions (rendered BEFORE the config widgets so Load can
+        #    set their session-state keys and rerun cleanly) ──────────────────
+        report_defs = _load_report_defs()
+        with st.expander("Saved reports", expanded=False):
+            if report_defs:
+                sr1, sr2, sr3 = st.columns([3, 1, 1])
+                with sr1:
+                    picked = st.selectbox(
+                        "Saved report", options=sorted(report_defs),
+                        key="rb_saved_pick", label_visibility="collapsed")
+                with sr2:
+                    if st.button("Load", key="rb_load", use_container_width=True):
+                        d = report_defs.get(picked, {})
+                        st.session_state["rb_dims"] = [
+                            x for x in d.get("dims", []) if x in REPORT_DIM_OPTIONS]
+                        st.session_state["rb_measures"] = [
+                            m for m in d.get("measures", []) if m in MEASURE_SPECS]
+                        if d.get("account_type") in ("E", "R"):
+                            st.session_state["builder_acct_type"] = d["account_type"]
+                        st.session_state["rb_totals"] = bool(d.get("totals", False))
+                        st.session_state["rb_raw_vals"] = bool(d.get("raw", False))
+                        st.rerun()
+                with sr3:
+                    if st.button("Delete", key="rb_delete", use_container_width=True):
+                        report_defs.pop(picked, None)
+                        _save_report_defs(report_defs)
+                        st.rerun()
+            else:
+                st.caption("No saved reports yet — configure one below and save it.")
+
+            sn1, sn2 = st.columns([3, 1])
+            with sn1:
+                new_name = st.text_input(
+                    "Save current configuration as", key="rb_name",
+                    placeholder="e.g. Q2 charter burn by fund/function",
+                    label_visibility="collapsed")
+            with sn2:
+                if st.button("Save", key="rb_save", use_container_width=True) and new_name.strip():
+                    report_defs[new_name.strip()] = {
+                        "dims": st.session_state.get("rb_dims", []),
+                        "measures": st.session_state.get("rb_measures", []),
+                        "account_type": st.session_state.get("builder_acct_type", "E"),
+                        "totals": st.session_state.get("rb_totals", False),
+                        "raw": st.session_state.get("rb_raw_vals", False),
+                    }
+                    _save_report_defs(report_defs)
+                    st.success(f"Saved '{new_name.strip()}'")
+
+        # ── Configuration ────────────────────────────────────────────────────
+        # Seed defaults via session state (not widget default=) so Load can
+        # write these keys without the default-vs-session-state warning.
+        st.session_state.setdefault("rb_dims", ["Fund", "Function", "Object"])
+        st.session_state.setdefault(
+            "rb_measures",
+            ["Adjusted Budget", "YTD Actuals", "Encumbrance",
+             "Available Balance", "Burn % (Act + Enc)"])
+
+        cfg1, cfg2 = st.columns([2, 3])
+        with cfg1:
+            row_dims = st.multiselect(
+                "Row dimensions (in order)", options=REPORT_DIM_OPTIONS,
+                key="rb_dims",
+                help="Rows group left-to-right in the order you select them.")
+        with cfg2:
+            measures = st.multiselect(
+                "Measures", options=list(MEASURE_SPECS), key="rb_measures",
+                help="Columns appear in the order you select them. Available "
+                     "Balance and Burn % derive from Adjusted Budget, YTD, and "
+                     "Encumbrance even when those aren't displayed.")
+
+        rb_act_f, rb_bud_f, rb_acct_type = render_tab_filters(
+            "builder", act_global, bud_global, dims=FILTER_DIMS, show_acct_type=True
+        )
+
+        oc1, oc2, oc3 = st.columns([1, 2, 3])
+        with oc1:
+            include_totals = st.checkbox("Totals row", key="rb_totals")
+        with oc2:
+            rb_raw_vals = st.toggle(
+                "Raw numeric values", key="rb_raw_vals",
+                help="On: unformatted numbers for pivoting/analysis. "
+                     "Off: accounting format.")
+
+        if not row_dims:
+            st.info("Pick at least one row dimension to build the report.")
+        elif not measures:
+            st.info("Pick at least one measure.")
+        else:
+            report = build_custom_report(
+                rb_act_f, rb_bud_f, row_dims, measures,
+                raw=rb_raw_vals, totals=include_totals)
+
+            st.markdown(f"**{len(report):,} rows** · {entity_label} · {fy_label} · {period_label}")
+            st.dataframe(report, use_container_width=True, height=500)
+
+            entity_short = (selected_entity.replace(" ", "_").replace("/", "-")
+                            if selected_entity != "— All Entities —" else "statewide")
+            fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
+            period_code = selected_period.lower() if selected_period else "all"
+            base_name = f"{entity_short}_fy{fy_code}_{period_code}_custom"
+
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button(
+                    "Custom Report CSV",
+                    data=report.to_csv(index=False),
+                    file_name=f"{base_name}.csv",
+                    mime="text/csv", key="rb_dl_csv")
+            with d2:
+                st.download_button(
+                    "Custom Report Excel",
+                    data=to_excel_download(report, "Custom Report"),
+                    file_name=f"{base_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="rb_dl_xlsx")
+
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # TAB 5: SALARY & BENEFITS
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Salary & Benefits":
 
