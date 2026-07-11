@@ -1,5 +1,5 @@
 """
-OBMS Financial Explorer v2
+OBMS Financial Explorer v3
 NM PED · School Budget Bureau
 Reads parquet files from Google Drive (extracted from OBMS SSAS cubes via XMLA)
 
@@ -12,9 +12,33 @@ Tabs:
 Design pass (Jul 2026): restyled to match the Contacts app's "institutional
   clarity" language — teal as the structural accent, gold as hairline
   dividers, coral reserved for alert states, light-yellow panels retired,
-  de-emojified labels, serif masthead. Logic unchanged, with one exception:
-  the tab radio no longer passes both `index=` and `key=` (which triggers a
-  Streamlit session-state warning); the widget key alone now carries state.
+  de-emojified labels, serif masthead.
+
+Under-the-hood pass (Jul 2026): performance + maintainability. Analytics
+  outputs unchanged; the changes are:
+  - Google Drive registry now reads gdrive_manifest.json (sitting next to
+    this file) when present, falling back to the embedded dict. New fiscal
+    years become a JSON edit, not a code edit.
+  - Parquet loads download once via urllib, read the file's schema, and
+    materialize ONLY the columns the app uses — lower peak memory.
+  - Per-fiscal-year concat + dtype prep is cached with st.cache_resource,
+    so reruns (every widget click) reuse the in-memory frames instead of
+    re-concatenating. These shared frames are treated as READ-ONLY:
+    downstream code only filters/copies, never mutates them in place.
+  - OBMS dimension columns are cast to pandas Categoricals after concat —
+    large memory savings and faster groupbys. Every groupby in the app now
+    passes observed=True (REQUIRED with categoricals: the default would
+    emit the full cartesian product of category combinations).
+  - fillna after merges goes through fillna_numeric(), which fills only
+    numeric columns (calling .fillna(0) on a categorical column raises).
+  - Excel bytes for download buttons are cached instead of being rebuilt
+    on every rerun.
+  - Export builders accept raw=True to emit unformatted numeric values
+    (toggle in each export section) for downstream pivoting/analysis;
+    default remains the accounting format.
+  - Budget-vs-actuals aggregation is factored into budget_vs_actuals(),
+    shared by the Budget Authority and Actuals tabs so the over-authority
+    flag logic can't drift between them.
 """
 
 import streamlit as st
@@ -24,6 +48,7 @@ import plotly.graph_objects as go
 from io import BytesIO
 from datetime import datetime
 import json
+import urllib.request
 import numpy as np
 import base64
 from pathlib import Path
@@ -180,7 +205,13 @@ def classify_fund(fund_str):
 
 
 # ── Google Drive File Registry ───────────────────────────────────────────────
-GDRIVE_FILES = {
+# The registry now lives in gdrive_manifest.json next to this file, so adding
+# a new fiscal year is a JSON edit (or a line in obms_extract.py that rewrites
+# the manifest) rather than an app-code change. The embedded dict below is the
+# fallback if the manifest is missing or unreadable.
+_MANIFEST_PATH = Path(__file__).parent / "gdrive_manifest.json"
+
+_EMBEDDED_GDRIVE_FILES = {
     "actuals_0607": "1tRjPX98VYEU9hA8KpOxoe4g16gz7XzF7",
     "actuals_0708": "1O02w9W496AGDy6RiNCO3jcDRas6S5wc8",
     "actuals_0809": "17Qwl1VERONBkkjJ8cQi_8KuBJfg-Ob3N",
@@ -225,6 +256,22 @@ GDRIVE_FILES = {
 }
 
 
+def _load_gdrive_registry() -> dict:
+    """Prefer gdrive_manifest.json; fall back to the embedded dict."""
+    try:
+        if _MANIFEST_PATH.exists():
+            with open(_MANIFEST_PATH) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                return data
+    except Exception:
+        pass  # unreadable manifest → embedded fallback
+    return _EMBEDDED_GDRIVE_FILES
+
+
+GDRIVE_FILES = _load_gdrive_registry()
+
+
 def gdrive_download_url(file_id: str) -> str:
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
@@ -242,19 +289,66 @@ ALL_FY_KEYS = sorted([fy_code_to_key(c) for c in ALL_FY_CODES])
 FY_LABELS = {k: f"{k-1}–{k}" for k in ALL_FY_KEYS}
 
 
-@st.cache_data(ttl=3600)
-def load_single_parquet(file_key: str) -> pd.DataFrame:
-    file_id = GDRIVE_FILES.get(file_key)
+# ── Column Contracts (used for pruned parquet reads + dtype prep) ────────────
+# Full OBMS string: Fund, Function, Object, Program, Location, Job Class
+OBMS_DIMS = ["Budget Entity", "Fund", "Function", "Object", "Program", "Location", "Job Class"]
+# Filterable dimensions (excludes entity which is global)
+FILTER_DIMS = ["Fund", "Function", "Object", "Program", "Location", "Job Class"]
+
+ACTUALS_COLS = OBMS_DIMS + [
+    "Account Type", "Reporting Period",
+    "Actuals Period Amount", "Actuals YTDAmount", "Actuals Encumbrance", "Actuals FTE",
+]
+BUDGET_COLS = OBMS_DIMS + [
+    "Account Type",
+    "Final Amt", "Final FTE", "Adjustment Amt", "Adjustment FTE",
+    "Adjusted Amt", "Adjusted FTE",
+]
+# Repeated-string columns → Categoricals after concat (memory + groupby speed)
+CATEGORICAL_COLS = OBMS_DIMS + ["Account Type", "Reporting Period"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_single_parquet(file_key: str, file_id: str) -> pd.DataFrame:
+    """
+    Download one parquet from Google Drive and materialize only the columns
+    the app uses. The whole file still travels over the wire (Drive doesn't
+    support range requests on these links), but pruning at read time keeps
+    peak memory to compressed-bytes + selected columns instead of the full
+    decompressed table. file_id is part of the cache key so a manifest
+    update busts stale entries.
+    """
     if not file_id:
         return pd.DataFrame()
     try:
-        return pd.read_parquet(gdrive_download_url(file_id))
+        req = urllib.request.Request(
+            gdrive_download_url(file_id),
+            headers={"User-Agent": "Mozilla/5.0 (OBMS-Explorer)"},
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            buf = BytesIO(resp.read())
+
+        import pyarrow.parquet as pq
+        available = set(pq.ParquetFile(buf).schema_arrow.names)
+        wanted = ACTUALS_COLS if file_key.startswith("actuals") else BUDGET_COLS
+        cols = [c for c in wanted if c in available] or None
+
+        buf.seek(0)
+        return pd.read_parquet(buf, columns=cols)
     except Exception as e:
         st.warning(f"Failed to load {file_key}: {e}")
         return pd.DataFrame()
 
 
-def load_data_for_years(fy_keys: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]:
+@st.cache_resource(ttl=3600, show_spinner="Loading OBMS data…")
+def get_year_data(fy_keys: tuple[int, ...]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Concat all files for the selected fiscal years and prep dtypes, once.
+    cache_resource hands back the SAME in-memory frames on every rerun
+    (no per-rerun pickling/copying) — so these frames are READ-ONLY by
+    contract. Downstream code must filter into new frames or .copy()
+    before mutating, never assign into them.
+    """
     actuals_dfs, budget_dfs = [], []
     fy_codes = [fy_key_to_code(k) for k in fy_keys]
     files_to_load = [f"{t}_{c}" for c in fy_codes for t in ["actuals", "budget"]
@@ -265,7 +359,7 @@ def load_data_for_years(fy_keys: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]
     progress = st.progress(0, text="Loading data...")
     for i, key in enumerate(files_to_load):
         progress.progress((i + 1) / len(files_to_load), text=f"Loading {key}.parquet...")
-        df = load_single_parquet(key)
+        df = load_single_parquet(key, GDRIVE_FILES.get(key, ""))
         if len(df) > 0:
             if key.startswith("actuals_"):
                 actuals_dfs.append(df)
@@ -275,6 +369,14 @@ def load_data_for_years(fy_keys: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]
 
     act = pd.concat(actuals_dfs, ignore_index=True) if actuals_dfs else pd.DataFrame()
     bud = pd.concat(budget_dfs, ignore_index=True) if budget_dfs else pd.DataFrame()
+
+    # Cast AFTER concat: concatenating categoricals with unequal category
+    # sets silently falls back to object dtype, which defeats the purpose.
+    for frame in (act, bud):
+        for c in CATEGORICAL_COLS:
+            if c in frame.columns:
+                frame[c] = frame[c].astype("category")
+
     return act, bud
 
 
@@ -320,18 +422,25 @@ def extract_name(text):
     return parts[1].strip() if len(parts) > 1 else parts[0].strip()
 
 
-def to_excel_download(df, sheet_name="Data"):
+def fillna_numeric(df: pd.DataFrame, value=0) -> pd.DataFrame:
+    """
+    Fill NaNs in numeric columns only. A bare .fillna(0) after a merge
+    raises on Categorical key columns (0 isn't a valid category), so all
+    post-merge fills go through here.
+    """
+    num_cols = df.select_dtypes(include="number").columns
+    df[num_cols] = df[num_cols].fillna(value)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def to_excel_download(df: pd.DataFrame, sheet_name: str = "Data") -> bytes:
+    """Cached: st.download_button eagerly evaluates its data argument, so
+    without caching every rerun rebuilds every workbook on the page."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=False)
     return output.getvalue()
-
-
-# ── OBMS Dimension Columns ──────────────────────────────────────────────────
-# Full OBMS string: Fund, Function, Object, Program, Location, Job Class
-OBMS_DIMS = ["Budget Entity", "Fund", "Function", "Object", "Program", "Location", "Job Class"]
-# Filterable dimensions (excludes entity which is global)
-FILTER_DIMS = ["Fund", "Function", "Object", "Program", "Location", "Job Class"]
 
 
 def get_unique_values(act_df, bud_df, col):
@@ -355,14 +464,54 @@ def apply_dim_filters(df, filters: dict) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BUDGET VS ACTUALS (shared by Budget Authority + Actuals tabs)
+# ══════════════════════════════════════════════════════════════════════════════
+def budget_vs_actuals(bud_df: pd.DataFrame, act_df: pd.DataFrame,
+                      group_col: str) -> pd.DataFrame:
+    """
+    Aggregate budget authority against actuals + encumbrances by one
+    dimension. Single source of truth for Available / % Used so the
+    over-authority flag can't drift between tabs.
+    """
+    b_agg = bud_df.groupby(group_col, observed=True).agg(
+        Adjusted_Budget=("Adjusted Amt", "sum"),
+        Budget_FTE=("Adjusted FTE", "sum"),
+    ).reset_index()
+
+    a_agg = act_df.groupby(group_col, observed=True).agg(
+        YTD_Actuals=("Actuals YTDAmount", "sum"),
+        Encumbrance=("Actuals Encumbrance", "sum"),
+        Actuals_FTE=("Actuals FTE", "sum"),
+    ).reset_index()
+
+    bva = fillna_numeric(b_agg.merge(a_agg, on=group_col, how="outer"))
+    bva["Available"] = bva["Adjusted_Budget"] - bva["YTD_Actuals"] - bva["Encumbrance"]
+    bva["Pct_Used"] = ((bva["YTD_Actuals"] + bva["Encumbrance"]) /
+                       bva["Adjusted_Budget"].replace(0, np.nan) * 100)
+    bva["Name"] = bva[group_col].apply(extract_name)
+    return bva.sort_values("Adjusted_Budget", ascending=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BUDGET AUTHORITY REPORT BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
-def build_budget_report(bud_df, entity_name, account_type):
+BUDGET_CSV_COLS = [
+    "Entity", "Fund", "Function", "Object", "Program", "Location", "JobClass",
+    "Beginning Budget", "Beginning FTE", "Adjustment Amount", "Adjustment FTE",
+    "Adjusted Budget", "Adjusted FTE"
+]
+
+
+def build_budget_report(bud_df, entity_name, account_type, raw=False):
     """
-    Build budget authority CSV matching the exact format:
+    Build budget authority report:
     Entity, Fund, Function, Object, Program, Location, JobClass,
     Beginning Budget, Beginning FTE, Adjustment Amount, Adjustment FTE,
     Adjusted Budget, Adjusted FTE
+
+    raw=False (default): accounting-formatted strings, matching the
+    established export format. raw=True: unformatted numeric values for
+    downstream pivoting/analysis.
     """
     b = bud_df[
         (bud_df["Budget Entity"] == entity_name) &
@@ -370,13 +519,9 @@ def build_budget_report(bud_df, entity_name, account_type):
     ].copy()
 
     if len(b) == 0:
-        return pd.DataFrame(columns=[
-            "Entity", "Fund", "Function", "Object", "Program", "Location", "JobClass",
-            "Beginning Budget", "Beginning FTE", "Adjustment Amount", "Adjustment FTE",
-            "Adjusted Budget", "Adjusted FTE"
-        ])
+        return pd.DataFrame(columns=BUDGET_CSV_COLS)
 
-    agg = b.groupby(OBMS_DIMS, dropna=False).agg(
+    agg = b.groupby(OBMS_DIMS, dropna=False, observed=True).agg(
         beg_budget=("Final Amt", "sum"),
         beg_fte=("Final FTE", "sum"),
         adj_amt=("Adjustment Amt", "sum"),
@@ -395,12 +540,20 @@ def build_budget_report(bud_df, entity_name, account_type):
     report["Program"] = agg["Program"]
     report["Location"] = agg["Location"]
     report["JobClass"] = agg["Job Class"]
-    report["Beginning Budget"] = agg["beg_budget"].apply(fmt_acct_currency)
-    report["Beginning FTE"] = agg["beg_fte"].apply(lambda v: f"{v:.2f}")
-    report["Adjustment Amount"] = agg["adj_amt"].apply(fmt_acct_currency)
-    report["Adjustment FTE"] = agg["adj_fte"].apply(lambda v: f"{v:.2f}")
-    report["Adjusted Budget"] = agg["adj_budget"].apply(fmt_acct_currency)
-    report["Adjusted FTE"] = agg["adjusted_fte"].apply(lambda v: f"{v:.2f}")
+    report["Beginning Budget"] = agg["beg_budget"]
+    report["Beginning FTE"] = agg["beg_fte"]
+    report["Adjustment Amount"] = agg["adj_amt"]
+    report["Adjustment FTE"] = agg["adj_fte"]
+    report["Adjusted Budget"] = agg["adj_budget"]
+    report["Adjusted FTE"] = agg["adjusted_fte"]
+
+    if raw:
+        return report
+
+    for col in ["Beginning Budget", "Adjustment Amount", "Adjusted Budget"]:
+        report[col] = report[col].apply(fmt_acct_currency)
+    for col in ["Beginning FTE", "Adjustment FTE", "Adjusted FTE"]:
+        report[col] = report[col].apply(lambda v: f"{v:.2f}")
 
     return report
 
@@ -414,9 +567,20 @@ ACTUALS_CSV_COLS = [
     "Adjusted Budget", "Adjusted FTE", "Available Balance", "Burn % (Actuals + Enc)"
 ]
 
+_ACT_MONEY_COLS = ["Actuals Period Amount", "Actuals YTD", "Encumbrance"]
+_ACT_SIDE_COLS = _ACT_MONEY_COLS + ["Actuals FTE"]
+_BUD_SIDE_COLS = ["Adjusted Budget", "Adjusted FTE"]
 
-def build_actuals_report(act_df, bud_df, entity_name, account_type):
-    """Build line-item actuals report with full OBMS string including Location."""
+
+def build_actuals_report(act_df, bud_df, entity_name, account_type, raw=False):
+    """
+    Build line-item actuals report with full OBMS string including Location.
+
+    raw=False (default): accounting-formatted strings; budget-only rows show
+    blank actuals cells and actuals-only rows show blank budget cells (as
+    before). raw=True: unformatted numeric values with NaN in those cells
+    (empty in CSV) for downstream pivoting/analysis.
+    """
     act = act_df[
         (act_df["Budget Entity"] == entity_name) &
         (act_df["Account Type"] == account_type)
@@ -431,7 +595,7 @@ def build_actuals_report(act_df, bud_df, entity_name, account_type):
         return pd.DataFrame(columns=ACTUALS_CSV_COLS)
 
     if len(act) > 0:
-        a_agg = act.groupby(OBMS_DIMS, dropna=False).agg(
+        a_agg = act.groupby(OBMS_DIMS, dropna=False, observed=True).agg(
             period_amt=("Actuals Period Amount", "sum"),
             ytd_amt=("Actuals YTDAmount", "sum"),
             enc_amt=("Actuals Encumbrance", "sum"),
@@ -441,7 +605,7 @@ def build_actuals_report(act_df, bud_df, entity_name, account_type):
         a_agg = pd.DataFrame(columns=OBMS_DIMS + ["period_amt", "ytd_amt", "enc_amt", "act_fte"])
 
     if len(bud) > 0:
-        b_agg = bud.groupby(OBMS_DIMS, dropna=False).agg(
+        b_agg = bud.groupby(OBMS_DIMS, dropna=False, observed=True).agg(
             adj_budget=("Adjusted Amt", "sum"),
             adj_fte=("Adjusted FTE", "sum"),
         ).reset_index()
@@ -449,6 +613,16 @@ def build_actuals_report(act_df, bud_df, entity_name, account_type):
         b_agg = pd.DataFrame(columns=OBMS_DIMS + ["adj_budget", "adj_fte"])
 
     merged = b_agg.merge(a_agg, on=OBMS_DIMS, how="outer")
+
+    # When one side has no rows at all — e.g., an entity whose budget is
+    # loaded but which hasn't submitted actuals for the selected period —
+    # its empty-frame placeholder above carries object-dtype columns, and
+    # the merge propagates that. Force the measure columns numeric so the
+    # arithmetic and the burn-% assignment below behave identically on the
+    # empty-side path. (Root cause of the FY26-Q3 "Invalid value '[]' for
+    # dtype 'float64'" crash for entities with no actuals yet.)
+    for c in ["period_amt", "ytd_amt", "enc_amt", "act_fte", "adj_budget", "adj_fte"]:
+        merged[c] = pd.to_numeric(merged[c], errors="coerce")
 
     merged["avail_balance"] = (
         merged["adj_budget"].fillna(0)
@@ -458,12 +632,13 @@ def build_actuals_report(act_df, bud_df, entity_name, account_type):
 
     has_budget = merged["adj_budget"].notna() & (merged["adj_budget"] != 0)
     has_actuals = merged["ytd_amt"].notna() | merged["enc_amt"].notna()
-    merged["burn_pct"] = pd.NA
+    merged["burn_pct"] = np.nan
     mask = has_actuals & has_budget
-    merged.loc[mask, "burn_pct"] = (
-        (merged.loc[mask, "ytd_amt"].fillna(0) + merged.loc[mask, "enc_amt"].fillna(0))
-        / merged.loc[mask, "adj_budget"] * 100
-    )
+    if mask.any():  # assigning an empty selection into float64 raises on newer pandas
+        merged.loc[mask, "burn_pct"] = (
+            (merged.loc[mask, "ytd_amt"].fillna(0) + merged.loc[mask, "enc_amt"].fillna(0))
+            / merged.loc[mask, "adj_budget"] * 100
+        )
 
     merged = merged.sort_values(OBMS_DIMS).reset_index(drop=True)
 
@@ -475,38 +650,36 @@ def build_actuals_report(act_df, bud_df, entity_name, account_type):
     report["Program"] = merged["Program"]
     report["Location"] = merged["Location"]
     report["JobClass"] = merged["Job Class"]
+    report["Actuals Period Amount"] = merged["period_amt"]
+    report["Actuals YTD"] = merged["ytd_amt"]
+    report["Encumbrance"] = merged["enc_amt"]
+    report["Actuals FTE"] = merged["act_fte"]
+    report["Adjusted Budget"] = merged["adj_budget"]
+    report["Adjusted FTE"] = merged["adj_fte"]
+    report["Available Balance"] = merged["avail_balance"]
+    report["Burn % (Actuals + Enc)"] = merged["burn_pct"]
 
-    report["Actuals Period Amount"] = merged["period_amt"].apply(
-        lambda v: fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else fmt_acct_currency(v))
-    )
-    report["Actuals YTD"] = merged["ytd_amt"].apply(
-        lambda v: fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else fmt_acct_currency(v))
-    )
-    report["Encumbrance"] = merged["enc_amt"].apply(
-        lambda v: fmt_acct_currency(v) if pd.notna(v) and v != 0 else ("" if pd.isna(v) else fmt_acct_currency(v))
-    )
-    report["Actuals FTE"] = merged["act_fte"].apply(
-        lambda v: "" if pd.isna(v) else f"{v:.2f}" if v != 0 else "0.00"
-    )
-    report["Adjusted Budget"] = merged["adj_budget"].apply(
-        lambda v: fmt_acct_currency(v) if pd.notna(v) else ""
-    )
-    report["Adjusted FTE"] = merged["adj_fte"].apply(
-        lambda v: "" if pd.isna(v) else f"{v:.2f}" if v != 0 else "0.00"
-    )
-    report["Available Balance"] = merged["avail_balance"].apply(fmt_acct_currency)
-    report["Burn % (Actuals + Enc)"] = merged["burn_pct"].apply(
+    # Blank out (NaN) actuals cols for budget-only rows, budget cols for
+    # actuals-only rows — same semantics as before, applied to the numeric
+    # frame so both raw and formatted paths agree.
+    report.loc[~has_actuals, _ACT_SIDE_COLS] = np.nan
+    report.loc[~has_budget, _BUD_SIDE_COLS] = np.nan
+
+    if raw:
+        return report
+
+    for col in _ACT_MONEY_COLS + ["Adjusted Budget"]:
+        report[col] = report[col].apply(
+            lambda v: "" if pd.isna(v) else fmt_acct_currency(v)
+        )
+    for col in ["Actuals FTE", "Adjusted FTE"]:
+        report[col] = report[col].apply(
+            lambda v: "" if pd.isna(v) else f"{v:.2f}"
+        )
+    report["Available Balance"] = report["Available Balance"].apply(fmt_acct_currency)
+    report["Burn % (Actuals + Enc)"] = report["Burn % (Actuals + Enc)"].apply(
         lambda v: "" if pd.isna(v) else f"{v:.2f}%"
     )
-
-    # Blank out actuals cols for budget-only rows
-    budget_only = ~has_actuals
-    for col in ["Actuals Period Amount", "Actuals YTD", "Encumbrance", "Actuals FTE"]:
-        report.loc[budget_only, col] = ""
-
-    actuals_only = ~has_budget
-    for col in ["Adjusted Budget", "Adjusted FTE"]:
-        report.loc[actuals_only, col] = ""
 
     return report
 
@@ -602,7 +775,9 @@ def main():
         st.warning("Select at least one fiscal year.")
         st.stop()
 
-    act_raw, bud_raw = load_data_for_years(selected_fy)
+    # Shared, cached, READ-ONLY frames — filter into new frames downstream,
+    # .copy() before mutating. Never assign into these.
+    act_raw, bud_raw = get_year_data(tuple(selected_fy))
 
     if len(act_raw) == 0 and len(bud_raw) == 0:
         st.error("No data loaded. Check that Google Drive files are publicly shared.")
@@ -611,7 +786,7 @@ def main():
     with st.sidebar:
         # Period selector
         available_periods = sorted(
-            act_raw["Reporting Period"].unique()
+            act_raw["Reporting Period"].dropna().unique()
         ) if len(act_raw) > 0 else []
 
         if available_periods:
@@ -643,13 +818,14 @@ def main():
         st.caption(f"Loaded: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
 
 
-    # ── Apply global entity filter to raw data ───────────────────────────────────
+    # ── Apply global entity filter (boolean masks make new frames; the raw
+    #    frames stay untouched, so no defensive full-frame copies needed) ────
     if selected_entity != "— All Entities —":
-        act_global = act_raw[act_raw["Budget Entity"] == selected_entity].copy() if len(act_raw) > 0 else act_raw.copy()
-        bud_global = bud_raw[bud_raw["Budget Entity"] == selected_entity].copy() if len(bud_raw) > 0 else bud_raw.copy()
+        act_global = act_raw[act_raw["Budget Entity"] == selected_entity] if len(act_raw) > 0 else act_raw
+        bud_global = bud_raw[bud_raw["Budget Entity"] == selected_entity] if len(bud_raw) > 0 else bud_raw
     else:
-        act_global = act_raw.copy()
-        bud_global = bud_raw.copy()
+        act_global = act_raw
+        bud_global = bud_raw
 
     # Apply period filter to actuals
     if selected_period and len(act_global) > 0:
@@ -777,15 +953,15 @@ def main():
         # ── Revenue vs Expenditure by Fund ───────────────────────────────────
         st.markdown('<div class="section-header">Revenue vs. Expenditure by Fund</div>', unsafe_allow_html=True)
 
-        rev_by_fund = rev_act.groupby("Fund").agg(
+        rev_by_fund = rev_act.groupby("Fund", observed=True).agg(
             Revenue_YTD=("Actuals YTDAmount", "sum")
         ).reset_index() if len(rev_act) > 0 else pd.DataFrame(columns=["Fund", "Revenue_YTD"])
 
-        exp_by_fund = exp_act.groupby("Fund").agg(
+        exp_by_fund = exp_act.groupby("Fund", observed=True).agg(
             Expenditure_YTD=("Actuals YTDAmount", "sum")
         ).reset_index() if len(exp_act) > 0 else pd.DataFrame(columns=["Fund", "Expenditure_YTD"])
 
-        fund_merged = rev_by_fund.merge(exp_by_fund, on="Fund", how="outer").fillna(0)
+        fund_merged = fillna_numeric(rev_by_fund.merge(exp_by_fund, on="Fund", how="outer"))
         fund_merged["Net"] = fund_merged["Revenue_YTD"] - fund_merged["Expenditure_YTD"]
         fund_merged["Total_Activity"] = fund_merged["Revenue_YTD"].abs() + fund_merged["Expenditure_YTD"].abs()
         fund_merged["Fund_Name"] = fund_merged["Fund"].apply(extract_name)
@@ -920,17 +1096,17 @@ def main():
         st.markdown('<div class="section-header">Expenditure by Function</div>', unsafe_allow_html=True)
 
         if len(exp_act) > 0:
-            func_exp = exp_act.groupby("Function").agg(
+            func_exp = exp_act.groupby("Function", observed=True).agg(
                 YTD=("Actuals YTDAmount", "sum")
             ).reset_index()
             func_exp["Name"] = func_exp["Function"].apply(extract_name)
             func_exp = func_exp[func_exp["YTD"] > 0].sort_values("YTD", ascending=False)
 
-            func_bud_agg = exp_bud.groupby("Function").agg(
+            func_bud_agg = exp_bud.groupby("Function", observed=True).agg(
                 Budget=("Adjusted Amt", "sum")
             ).reset_index() if len(exp_bud) > 0 else pd.DataFrame(columns=["Function", "Budget"])
 
-            func_merged = func_exp.merge(func_bud_agg, on="Function", how="left").fillna(0)
+            func_merged = fillna_numeric(func_exp.merge(func_bud_agg, on="Function", how="left"))
             func_merged["Pct_Spent"] = (func_merged["YTD"] / func_merged["Budget"].replace(0, np.nan) * 100)
 
             if len(func_merged) > 0:
@@ -995,7 +1171,7 @@ def main():
         with rb1:
             st.markdown("**Revenue Budget by Fund**")
             if len(rev_bud_tab) > 0:
-                rev_by_fund_bud = rev_bud_tab.groupby("Fund").agg(
+                rev_by_fund_bud = rev_bud_tab.groupby("Fund", observed=True).agg(
                     Beginning=("Final Amt", "sum"),
                     Adjustments=("Adjustment Amt", "sum"),
                     Adjusted=("Adjusted Amt", "sum"),
@@ -1027,7 +1203,7 @@ def main():
         with rb2:
             st.markdown("**Expenditure Budget by Function**")
             if len(exp_bud_tab) > 0:
-                exp_by_func_bud = exp_bud_tab.groupby("Function").agg(
+                exp_by_func_bud = exp_bud_tab.groupby("Function", observed=True).agg(
                     Beginning=("Final Amt", "sum"),
                     Adjustments=("Adjustment Amt", "sum"),
                     Adjusted=("Adjusted Amt", "sum"),
@@ -1066,7 +1242,7 @@ def main():
             bars_data = bud_bud_f[bud_bud_f["Adjustment Amt"] != 0].copy()
 
             if len(bars_data) > 0:
-                bar_by_fund = bars_data.groupby("Fund").agg(
+                bar_by_fund = bars_data.groupby("Fund", observed=True).agg(
                     Increases=("Adjustment Amt", lambda x: x[x > 0].sum()),
                     Decreases=("Adjustment Amt", lambda x: x[x < 0].sum()),
                     Net_Adjustment=("Adjustment Amt", "sum"),
@@ -1099,7 +1275,7 @@ def main():
                 st.plotly_chart(fig_bar, use_container_width=True)
 
                 # Detail table
-                bar_detail = bars_data.groupby(["Fund", "Function"]).agg(
+                bar_detail = bars_data.groupby(["Fund", "Function"], observed=True).agg(
                     Beginning=("Final Amt", "sum"),
                     Adjustment=("Adjustment Amt", "sum"),
                     Adjusted=("Adjusted Amt", "sum"),
@@ -1134,23 +1310,7 @@ def main():
                 index=0, horizontal=True, key="bva_group"
             )
 
-            b_agg = bud_bud_f.groupby(bva_group).agg(
-                Adjusted_Budget=("Adjusted Amt", "sum"),
-                Budget_FTE=("Adjusted FTE", "sum"),
-            ).reset_index()
-
-            a_agg = bud_act_f.groupby(bva_group).agg(
-                YTD_Actuals=("Actuals YTDAmount", "sum"),
-                Encumbrance=("Actuals Encumbrance", "sum"),
-                Actuals_FTE=("Actuals FTE", "sum"),
-            ).reset_index()
-
-            bva = b_agg.merge(a_agg, on=bva_group, how="outer").fillna(0)
-            bva["Available"] = bva["Adjusted_Budget"] - bva["YTD_Actuals"] - bva["Encumbrance"]
-            bva["Pct_Used"] = ((bva["YTD_Actuals"] + bva["Encumbrance"]) /
-                            bva["Adjusted_Budget"].replace(0, np.nan) * 100)
-            bva["Name"] = bva[bva_group].apply(extract_name)
-            bva = bva.sort_values("Adjusted_Budget", ascending=False)
+            bva = budget_vs_actuals(bud_bud_f, bud_act_f, bva_group)
 
             # Flag lines exceeding budget authority
             exceeding = bva[bva["Available"] < 0]
@@ -1204,8 +1364,12 @@ def main():
         st.markdown('<div class="section-header">Budget Authority Export</div>', unsafe_allow_html=True)
 
         if selected_entity != "— All Entities —":
-            exp_budget_report = build_budget_report(bud_raw, selected_entity, "E")
-            rev_budget_report = build_budget_report(bud_raw, selected_entity, "R")
+            bud_raw_vals = st.toggle(
+                "Raw numeric values", key="bud_export_raw",
+                help="On: unformatted numbers for pivoting/analysis. Off: accounting format ($1,234.56 / parentheses for negatives)."
+            )
+            exp_budget_report = build_budget_report(bud_raw, selected_entity, "E", raw=bud_raw_vals)
+            rev_budget_report = build_budget_report(bud_raw, selected_entity, "R", raw=bud_raw_vals)
 
             entity_short = selected_entity.replace(" ", "_").replace("/", "-")
             fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
@@ -1294,7 +1458,7 @@ def main():
                 index=0, horizontal=True, key="act_spend_group"
             )
 
-            spend_data = act_act_f.groupby(spend_group).agg(
+            spend_data = act_act_f.groupby(spend_group, observed=True).agg(
                 YTD=("Actuals YTDAmount", "sum"),
                 Enc=("Actuals Encumbrance", "sum"),
             ).reset_index()
@@ -1329,25 +1493,17 @@ def main():
         st.markdown("#### Budget vs. Actuals by Function")
 
         if len(act_act_f) > 0 and len(act_bud_f) > 0:
-            func_b = act_bud_f.groupby("Function").agg(Budget=("Adjusted Amt", "sum")).reset_index()
-            func_a = act_act_f.groupby("Function").agg(
-                YTD=("Actuals YTDAmount", "sum"), Enc=("Actuals Encumbrance", "sum")
-            ).reset_index()
-            func_m = func_b.merge(func_a, on="Function", how="outer").fillna(0)
-            func_m["Available"] = func_m["Budget"] - func_m["YTD"] - func_m["Enc"]
-            func_m["Pct_Used"] = ((func_m["YTD"] + func_m["Enc"]) / func_m["Budget"].replace(0, np.nan) * 100)
-            func_m["Name"] = func_m["Function"].apply(extract_name)
-            func_m = func_m.sort_values("Budget", ascending=False)
+            func_m = budget_vs_actuals(act_bud_f, act_act_f, "Function")
 
-            top_func = func_m[func_m["Budget"] > 0].head(12)
+            top_func = func_m[func_m["Adjusted_Budget"] > 0].head(12)
             fig_fb = go.Figure()
             fig_fb.add_trace(go.Bar(
-                name="YTD Actuals", y=top_func["Name"], x=top_func["YTD"],
+                name="YTD Actuals", y=top_func["Name"], x=top_func["YTD_Actuals"],
                 orientation="h", marker_color="#245d62",
                 hovertemplate="%{y}<br>YTD: $%{x:,.0f}<extra></extra>"
             ))
             fig_fb.add_trace(go.Bar(
-                name="Encumbrance", y=top_func["Name"], x=top_func["Enc"],
+                name="Encumbrance", y=top_func["Name"], x=top_func["Encumbrance"],
                 orientation="h", marker_color="#edc872",
                 hovertemplate="%{y}<br>Enc: $%{x:,.0f}<extra></extra>"
             ))
@@ -1364,8 +1520,9 @@ def main():
             st.plotly_chart(fig_fb, use_container_width=True)
 
             st.dataframe(
-                func_m[["Function", "Budget", "YTD", "Enc", "Available", "Pct_Used"]].rename(columns={
-                    "Budget": "Adjusted Budget", "YTD": "YTD Actuals", "Enc": "Encumbrance",
+                func_m[["Function", "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
+                        "Available", "Pct_Used"]].rename(columns={
+                    "Adjusted_Budget": "Adjusted Budget", "YTD_Actuals": "YTD Actuals",
                     "Pct_Used": "% Used (Act+Enc)"
                 }).style.format({
                     "Adjusted Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
@@ -1383,12 +1540,17 @@ def main():
         st.markdown('<div class="section-header">Actuals Export</div>', unsafe_allow_html=True)
 
         if selected_entity != "— All Entities —":
+            act_raw_vals = st.toggle(
+                "Raw numeric values", key="act_export_raw",
+                help="On: unformatted numbers for pivoting/analysis. Off: accounting format ($1,234.56 / parentheses for negatives)."
+            )
+
             entity_short = selected_entity.replace(" ", "_").replace("/", "-")
             fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
             period_code = selected_period.lower() if selected_period else "all"
 
-            exp_act_report = build_actuals_report(act_global, bud_global, selected_entity, "E")
-            rev_act_report = build_actuals_report(act_global, bud_global, selected_entity, "R")
+            exp_act_report = build_actuals_report(act_global, bud_global, selected_entity, "E", raw=act_raw_vals)
+            rev_act_report = build_actuals_report(act_global, bud_global, selected_entity, "R", raw=act_raw_vals)
 
             ac1, ac2 = st.columns(2)
             with ac1:
@@ -1443,7 +1605,9 @@ def main():
 
         st.markdown('<div class="section-header">Salary & Benefits Analysis</div>', unsafe_allow_html=True)
 
-        # Filter to expenditures only, salary/benefits/contracted objects
+        # Filter to expenditures only, salary/benefits/contracted objects.
+        # .copy() is REQUIRED here: classification columns are assigned below,
+        # and the parent frames are shared cache_resource objects.
         sal_act = act_global[act_global["Account Type"] == "E"].copy() if len(act_global) > 0 else pd.DataFrame()
         sal_bud = bud_global[bud_global["Account Type"] == "E"].copy() if len(bud_global) > 0 else pd.DataFrame()
 
@@ -1480,7 +1644,7 @@ def main():
         st.markdown("#### Expenditure Composition")
 
         if len(sal_act) > 0:
-            comp = sal_act.groupby("Obj_Category").agg(
+            comp = sal_act.groupby("Obj_Category", observed=True).agg(
                 YTD=("Actuals YTDAmount", "sum"), Enc=("Actuals Encumbrance", "sum")
             ).reset_index()
             comp["Total"] = comp["YTD"] + comp["Enc"]
@@ -1488,11 +1652,11 @@ def main():
             grand_total = comp["YTD"].sum()
             comp["Pct"] = comp["YTD"] / grand_total * 100
 
-            comp_bud = sal_bud.groupby("Obj_Category").agg(
+            comp_bud = sal_bud.groupby("Obj_Category", observed=True).agg(
                 Budget=("Adjusted Amt", "sum")
             ).reset_index() if len(sal_bud) > 0 else pd.DataFrame(columns=["Obj_Category", "Budget"])
 
-            comp = comp.merge(comp_bud, on="Obj_Category", how="left").fillna(0)
+            comp = fillna_numeric(comp.merge(comp_bud, on="Obj_Category", how="left"))
             comp["Pct_Used"] = ((comp["YTD"] + comp["Enc"]) / comp["Budget"].replace(0, np.nan) * 100)
 
             # KPI cards for salary / benefits / contracted
@@ -1558,17 +1722,17 @@ def main():
             # FTE by Job Class
             st.markdown("**FTE by Job Class**")
 
-            fte_bud_jc = sal_fte_bud.groupby("Job Class").agg(
+            fte_bud_jc = sal_fte_bud.groupby("Job Class", observed=True).agg(
                 Budget_FTE=("Adjusted FTE", "sum"),
                 Budget_Salary=("Adjusted Amt", "sum"),
             ).reset_index() if len(sal_fte_bud) > 0 else pd.DataFrame(columns=["Job Class", "Budget_FTE", "Budget_Salary"])
 
-            fte_act_jc = sal_fte_act.groupby("Job Class").agg(
+            fte_act_jc = sal_fte_act.groupby("Job Class", observed=True).agg(
                 Actual_FTE=("Actuals FTE", "sum"),
                 Actual_Salary=("Actuals YTDAmount", "sum"),
             ).reset_index() if len(sal_fte_act) > 0 else pd.DataFrame(columns=["Job Class", "Actual_FTE", "Actual_Salary"])
 
-            fte_jc = fte_bud_jc.merge(fte_act_jc, on="Job Class", how="outer").fillna(0)
+            fte_jc = fillna_numeric(fte_bud_jc.merge(fte_act_jc, on="Job Class", how="outer"))
             fte_jc["FTE_Variance"] = fte_jc["Actual_FTE"] - fte_jc["Budget_FTE"]
             fte_jc["Avg_Salary_Budget"] = (fte_jc["Budget_Salary"] / fte_jc["Budget_FTE"].replace(0, np.nan))
             fte_jc["Avg_Salary_Actual"] = (fte_jc["Actual_Salary"] / fte_jc["Actual_FTE"].replace(0, np.nan))
@@ -1625,17 +1789,17 @@ def main():
         )
 
         if len(sal_fte_bud) > 0 or len(sal_fte_act) > 0:
-            fb = sal_fte_bud.groupby("Func_Category").agg(
+            fb = sal_fte_bud.groupby("Func_Category", observed=True).agg(
                 Budget_FTE=("Adjusted FTE", "sum"),
                 Budget_Salary=("Adjusted Amt", "sum"),
             ).reset_index() if len(sal_fte_bud) > 0 else pd.DataFrame(columns=["Func_Category", "Budget_FTE", "Budget_Salary"])
 
-            fa = sal_fte_act.groupby("Func_Category").agg(
+            fa = sal_fte_act.groupby("Func_Category", observed=True).agg(
                 Actual_FTE=("Actuals FTE", "sum"),
                 Actual_Salary=("Actuals YTDAmount", "sum"),
             ).reset_index() if len(sal_fte_act) > 0 else pd.DataFrame(columns=["Func_Category", "Actual_FTE", "Actual_Salary"])
 
-            fc = fb.merge(fa, on="Func_Category", how="outer").fillna(0)
+            fc = fillna_numeric(fb.merge(fa, on="Func_Category", how="outer"))
             fc_total_fte = fc["Actual_FTE"].sum()
             fc["Pct_of_FTE"] = (fc["Actual_FTE"] / fc_total_fte * 100) if fc_total_fte > 0 else 0
             fc = fc.sort_values("Budget_FTE", ascending=False)
@@ -1675,15 +1839,15 @@ def main():
         con_bud = sal_bud[sal_bud["Obj_Category"] == "Contracted Services"] if len(sal_bud) > 0 else pd.DataFrame()
 
         if len(con_act) > 0 or len(con_bud) > 0:
-            con_b = con_bud.groupby(["Function", "Object"]).agg(
+            con_b = con_bud.groupby(["Function", "Object"], observed=True).agg(
                 Budget=("Adjusted Amt", "sum")
             ).reset_index() if len(con_bud) > 0 else pd.DataFrame(columns=["Function", "Object", "Budget"])
 
-            con_a = con_act.groupby(["Function", "Object"]).agg(
+            con_a = con_act.groupby(["Function", "Object"], observed=True).agg(
                 YTD=("Actuals YTDAmount", "sum"), Enc=("Actuals Encumbrance", "sum")
             ).reset_index() if len(con_act) > 0 else pd.DataFrame(columns=["Function", "Object", "YTD", "Enc"])
 
-            con_m = con_b.merge(con_a, on=["Function", "Object"], how="outer").fillna(0)
+            con_m = fillna_numeric(con_b.merge(con_a, on=["Function", "Object"], how="outer"))
             con_m["Available"] = con_m["Budget"] - con_m["YTD"] - con_m["Enc"]
             con_m["Pct_Used"] = ((con_m["YTD"] + con_m["Enc"]) / con_m["Budget"].replace(0, np.nan) * 100)
             con_m = con_m.sort_values("Budget", ascending=False)
