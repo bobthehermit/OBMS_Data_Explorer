@@ -47,6 +47,15 @@ Report Builder (Jul 2026): new tab. Compose a report from any combination
   and named report definitions persisted to report_definitions.json next
   to this file (commit the JSON to ship saved reports to HF Spaces —
   runtime writes there are ephemeral across rebuilds).
+
+Trends (Jul 2026): new tab. Multi-year view scoped by the sidebar entity,
+  with its own year-range slider and actuals-period control (fixed quarter
+  or latest-per-year). Never holds multiple years of line-level data:
+  each year is downloaded once, reduced to small per-year summary frames
+  (get_fy_summary, cached 24h), and the full frame is discarded — so a
+  20-year statewide trend costs megabytes, not gigabytes. Headline
+  revenue/expenditure and FTE trends, fund/function breakdown lines, and
+  a numeric trend table with YoY, exportable to CSV/Excel.
 """
 
 import streamlit as st
@@ -316,15 +325,18 @@ BUDGET_COLS = OBMS_DIMS + [
 CATEGORICAL_COLS = OBMS_DIMS + ["Account Type", "Reporting Period"]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_single_parquet(file_key: str, file_id: str) -> pd.DataFrame:
+def _download_pruned_parquet(file_key: str, file_id: str) -> pd.DataFrame:
     """
     Download one parquet from Google Drive and materialize only the columns
     the app uses. The whole file still travels over the wire (Drive doesn't
     support range requests on these links), but pruning at read time keeps
     peak memory to compressed-bytes + selected columns instead of the full
-    decompressed table. file_id is part of the cache key so a manifest
-    update busts stale entries.
+    decompressed table.
+
+    UNCACHED on purpose: the trends summarizer calls this directly so a
+    year's full frame lives only long enough to be aggregated, instead of
+    being pinned in the cache. The single-FY path wraps this in cache_data
+    below.
     """
     if not file_id:
         return pd.DataFrame()
@@ -346,6 +358,13 @@ def load_single_parquet(file_key: str, file_id: str) -> pd.DataFrame:
     except Exception as e:
         st.warning(f"Failed to load {file_key}: {e}")
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_single_parquet(file_key: str, file_id: str) -> pd.DataFrame:
+    """Cached wrapper for the single-FY tabs. file_id is part of the cache
+    key so a manifest update busts stale entries."""
+    return _download_pruned_parquet(file_key, file_id)
 
 
 @st.cache_resource(ttl=3600, show_spinner="Loading OBMS data…")
@@ -634,6 +653,126 @@ def _save_report_defs(defs: dict) -> None:
             json.dump(defs, f, indent=2)
     except Exception as e:
         st.warning(f"Could not save report definitions: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-YEAR TRENDS CORE
+# ══════════════════════════════════════════════════════════════════════════════
+# Strategy: never hold multiple years of line-level data in memory. Each
+# fiscal year is downloaded once, aggregated to small summary frames, and
+# the full frame is discarded. Historical years are immutable, so the
+# summaries cache for 24h (and rebuild cheaply after that).
+
+_ACT_SUMMARY_MEASURES = {
+    "YTD": ("Actuals YTDAmount", "sum"),
+    "Encumbrance": ("Actuals Encumbrance", "sum"),
+    "Actuals_FTE": ("Actuals FTE", "sum"),
+}
+_BUD_SUMMARY_MEASURES = {
+    "Adjusted_Budget": ("Adjusted Amt", "sum"),
+    "Beginning_Budget": ("Final Amt", "sum"),
+    "Adjusted_FTE": ("Adjusted FTE", "sum"),
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_fy_summary(fy_key: int, actuals_id: str, budget_id: str) -> dict:
+    """
+    Download one fiscal year and reduce it to six small summary frames:
+    actuals totals / by-fund / by-function (entity × account type × period)
+    and budget totals / by-fund / by-function (entity × account type).
+    Each frame carries an FY column. File ids in the cache key bust stale
+    entries on manifest updates.
+    """
+    fy_code = fy_key_to_code(fy_key)
+    act = _download_pruned_parquet(f"actuals_{fy_code}", actuals_id)
+    bud = _download_pruned_parquet(f"budget_{fy_code}", budget_id)
+
+    def _summarize(df, dims, measures):
+        cols = ["FY"] + dims + list(measures)
+        if len(df) == 0 or any(c not in df.columns for c in dims) \
+           or any(src not in df.columns for src, _ in measures.values()):
+            return pd.DataFrame(columns=cols)
+        g = df.groupby(dims, dropna=False, observed=True).agg(
+            **{out: spec for out, spec in measures.items()}
+        ).reset_index()
+        g.insert(0, "FY", fy_key)
+        return g
+
+    act_dims = ["Budget Entity", "Account Type", "Reporting Period"]
+    bud_dims = ["Budget Entity", "Account Type"]
+    return {
+        "act_totals": _summarize(act, act_dims, _ACT_SUMMARY_MEASURES),
+        "act_fund":   _summarize(act, act_dims + ["Fund"], _ACT_SUMMARY_MEASURES),
+        "act_func":   _summarize(act, act_dims + ["Function"], _ACT_SUMMARY_MEASURES),
+        "bud_totals": _summarize(bud, bud_dims, _BUD_SUMMARY_MEASURES),
+        "bud_fund":   _summarize(bud, bud_dims + ["Fund"], _BUD_SUMMARY_MEASURES),
+        "bud_func":   _summarize(bud, bud_dims + ["Function"], _BUD_SUMMARY_MEASURES),
+    }
+
+
+def load_trend_data(fy_keys: list[int]) -> dict:
+    """Assemble per-year summaries into concatenated trend frames."""
+    parts = {k: [] for k in ["act_totals", "act_fund", "act_func",
+                             "bud_totals", "bud_fund", "bud_func"]}
+    progress = st.progress(0, text="Building multi-year summaries…")
+    for i, fy in enumerate(fy_keys):
+        code = fy_key_to_code(fy)
+        s = get_fy_summary(
+            fy,
+            GDRIVE_FILES.get(f"actuals_{code}", ""),
+            GDRIVE_FILES.get(f"budget_{code}", ""),
+        )
+        for k, v in s.items():
+            if len(v) > 0:
+                parts[k].append(v)
+        progress.progress((i + 1) / len(fy_keys),
+                          text=f"Summarized {FY_LABELS.get(fy, fy)}")
+    progress.empty()
+    return {k: (pd.concat(v, ignore_index=True) if v else pd.DataFrame())
+            for k, v in parts.items()}
+
+
+def filter_trend_period(df: pd.DataFrame, period_mode: str) -> pd.DataFrame:
+    """Keep one actuals period per FY: a fixed period (e.g. 'Q04') or each
+    year's latest available ('Latest per year')."""
+    if len(df) == 0 or "Reporting Period" not in df.columns:
+        return df
+    if period_mode == "Latest per year":
+        latest = df.groupby("FY")["Reporting Period"].transform("max")
+        return df[df["Reporting Period"] == latest]
+    return df[df["Reporting Period"] == period_mode]
+
+
+def build_trend_totals(act_totals: pd.DataFrame, bud_totals: pd.DataFrame,
+                       fy_keys: list[int]) -> pd.DataFrame:
+    """
+    Per-FY headline series. Inputs must already be entity-scoped and
+    period-picked. Rows span all requested fiscal years so gaps (e.g. a
+    budget-only year) show as missing points rather than vanishing.
+    YoY is computed manually (pct_change's fill_method churn across pandas
+    versions makes it a portability hazard).
+    """
+    rows = pd.DataFrame({"FY": sorted(fy_keys)})
+
+    def series(df, acct, col):
+        if len(df) == 0 or col not in df.columns:
+            return pd.Series(dtype=float)
+        return df[df["Account Type"] == acct].groupby("FY")[col].sum()
+
+    rows["Revenue YTD"] = rows["FY"].map(series(act_totals, "R", "YTD"))
+    rows["Expenditure YTD"] = rows["FY"].map(series(act_totals, "E", "YTD"))
+    rows["Encumbrance"] = rows["FY"].map(series(act_totals, "E", "Encumbrance"))
+    rows["Expenditure Budget"] = rows["FY"].map(series(bud_totals, "E", "Adjusted_Budget"))
+    rows["Revenue Budget"] = rows["FY"].map(series(bud_totals, "R", "Adjusted_Budget"))
+    rows["Budget FTE"] = rows["FY"].map(series(bud_totals, "E", "Adjusted_FTE"))
+    rows["Actuals FTE"] = rows["FY"].map(series(act_totals, "E", "Actuals_FTE"))
+    rows["% Spent"] = (rows["Expenditure YTD"]
+                       / rows["Expenditure Budget"].replace(0, np.nan) * 100)
+    prev = rows["Expenditure YTD"].shift(1)
+    rows["Exp YoY %"] = (rows["Expenditure YTD"] / prev.replace(0, np.nan) - 1) * 100
+    rows["FY Label"] = rows["FY"].map(FY_LABELS)
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1049,7 +1188,7 @@ def main():
 
 
     # ── Tabs ─────────────────────────────────────────────────────────────────────
-    TAB_NAMES = ["Overview", "Budget Authority", "Actuals", "Report Builder", "Salary & Benefits"]
+    TAB_NAMES = ["Overview", "Budget Authority", "Actuals", "Report Builder", "Trends", "Salary & Benefits"]
 
     # NOTE: state lives in the widget key alone. Passing both `index=` (from
     # session state) and `key="active_tab"` triggers Streamlit's "widget
@@ -1872,7 +2011,214 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 5: SALARY & BENEFITS
+    # TAB 5: TRENDS
+    # ══════════════════════════════════════════════════════════════════════════════
+    elif st.session_state.active_tab == "Trends":
+
+        st.markdown('<div class="section-header">Multi-Year Trends</div>', unsafe_allow_html=True)
+        st.caption(
+            f"Longitudinal view for the sidebar's entity scope ({entity_label}). "
+            "The year range and actuals period are set here — the sidebar's fiscal "
+            "year and reporting period don't apply to this tab. First load of a "
+            "new year range downloads and summarizes each year once; repeat views "
+            "are cached."
+        )
+
+        if len(ALL_FY_KEYS) < 2:
+            st.info("Multi-year trends need at least two fiscal years in the registry.")
+        else:
+            default_start = ALL_FY_KEYS[max(0, len(ALL_FY_KEYS) - 10)]
+            yr_lo, yr_hi = st.select_slider(
+                "Fiscal year range",
+                options=ALL_FY_KEYS,
+                value=(default_start, ALL_FY_KEYS[-1]),
+                format_func=lambda k: FY_LABELS.get(k, str(k)),
+                key="tr_years",
+            )
+            trend_years = [k for k in ALL_FY_KEYS if yr_lo <= k <= yr_hi]
+
+            if len(trend_years) < 2:
+                st.info("Select a range of at least two fiscal years.")
+            else:
+                tdata = load_trend_data(trend_years)
+
+                def _scope(df):
+                    if (selected_entity != "— All Entities —" and len(df) > 0
+                            and "Budget Entity" in df.columns):
+                        return df[df["Budget Entity"] == selected_entity]
+                    return df
+
+                at_all = _scope(tdata["act_totals"])
+                bt_all = _scope(tdata["bud_totals"])
+
+                if len(at_all) == 0 and len(bt_all) == 0:
+                    st.warning(f"No data found for {entity_label} in this year range.")
+                else:
+                    periods_available = (sorted(at_all["Reporting Period"].dropna().unique())
+                                         if len(at_all) > 0 else [])
+                    period_options = periods_available + ["Latest per year"]
+                    default_idx = (periods_available.index("Q04")
+                                   if "Q04" in periods_available
+                                   else len(period_options) - 1)
+                    period_mode = st.radio(
+                        "Actuals period", options=period_options,
+                        index=default_idx, horizontal=True, key="tr_period",
+                        help="Compare the same quarter across years for apples-to-"
+                             "apples; 'Latest per year' uses whatever each year has."
+                    )
+                    if period_mode == "Latest per year":
+                        st.caption(
+                            "Note: 'Latest per year' can mix quarters — closed years "
+                            "show Q4 while the current year shows its most recent "
+                            "submitted period."
+                        )
+
+                    at = filter_trend_period(at_all, period_mode)
+                    totals = build_trend_totals(at, bt_all, trend_years)
+                    x_labels = totals["FY Label"].tolist()
+
+                    # ── Revenue vs Expenditure trend ──────────────────────────
+                    st.markdown("#### Revenue vs. Expenditure")
+                    fig_t1 = go.Figure()
+                    fig_t1.add_trace(go.Scatter(
+                        name="Revenue YTD", x=x_labels, y=totals["Revenue YTD"],
+                        mode="lines+markers", line=dict(color="#245d62", width=2.5),
+                        hovertemplate="%{x}<br>Revenue YTD: $%{y:,.0f}<extra></extra>"
+                    ))
+                    fig_t1.add_trace(go.Scatter(
+                        name="Expenditure YTD", x=x_labels, y=totals["Expenditure YTD"],
+                        mode="lines+markers", line=dict(color="#edc872", width=2.5),
+                        hovertemplate="%{x}<br>Expenditure YTD: $%{y:,.0f}<extra></extra>"
+                    ))
+                    fig_t1.add_trace(go.Scatter(
+                        name="Expenditure Budget", x=x_labels, y=totals["Expenditure Budget"],
+                        mode="lines+markers", line=dict(color="#1a474b", width=1.5, dash="dash"),
+                        hovertemplate="%{x}<br>Exp Budget: $%{y:,.0f}<extra></extra>"
+                    ))
+                    fig_t1.update_layout(
+                        **plotly_layout(height=380,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="right", x=1))
+                    )
+                    st.plotly_chart(fig_t1, use_container_width=True)
+
+                    # ── FTE trend ─────────────────────────────────────────────
+                    st.markdown("#### FTE")
+                    fig_t2 = go.Figure()
+                    fig_t2.add_trace(go.Scatter(
+                        name="Budget FTE", x=x_labels, y=totals["Budget FTE"],
+                        mode="lines+markers", line=dict(color="#245d62", width=1.5, dash="dash"),
+                        hovertemplate="%{x}<br>Budget FTE: %{y:,.1f}<extra></extra>"
+                    ))
+                    fig_t2.add_trace(go.Scatter(
+                        name="Actuals FTE", x=x_labels, y=totals["Actuals FTE"],
+                        mode="lines+markers", line=dict(color="#8fae5f", width=2.5),
+                        hovertemplate="%{x}<br>Actuals FTE: %{y:,.1f}<extra></extra>"
+                    ))
+                    fig_t2.update_layout(
+                        **plotly_layout(height=320,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="right", x=1))
+                    )
+                    st.plotly_chart(fig_t2, use_container_width=True)
+
+                    # ── Breakdown trend (Fund / Function) ─────────────────────
+                    st.markdown("#### Breakdown Over Time")
+                    bc1, bc2 = st.columns([1, 1])
+                    with bc1:
+                        tr_dim = st.radio("Break down by", options=["Fund", "Function"],
+                                          horizontal=True, key="tr_dim")
+                    with bc2:
+                        tr_acct = st.radio(
+                            "Account type", options=["E", "R"],
+                            format_func=lambda x: "Expenditure" if x == "E" else "Revenue",
+                            horizontal=True, key="tr_acct")
+
+                    src = _scope(tdata["act_fund" if tr_dim == "Fund" else "act_func"])
+                    src = filter_trend_period(src, period_mode)
+                    if len(src) > 0:
+                        src = src[src["Account Type"] == tr_acct]
+
+                    if len(src) == 0:
+                        st.info("No actuals in this scope for the breakdown.")
+                    else:
+                        rank = (src.groupby(tr_dim, observed=True)["YTD"].sum()
+                                .sort_values(ascending=False))
+                        series_options = [v for v in rank.index]
+                        sel = st.multiselect(
+                            f"{tr_dim}s to plot", options=series_options,
+                            default=series_options[:6],
+                            key=f"tr_series_{tr_dim}_{tr_acct}",
+                            help="Defaults to the largest by total YTD across the range.")
+
+                        if sel:
+                            fig_t3 = go.Figure()
+                            for val in sel:
+                                d = (src[src[tr_dim] == val]
+                                     .groupby("FY")["YTD"].sum())
+                                ys = [d.get(fy, np.nan) for fy in trend_years]
+                                fig_t3.add_trace(go.Scatter(
+                                    name=extract_name(val),
+                                    x=[FY_LABELS.get(fy, str(fy)) for fy in trend_years],
+                                    y=ys, mode="lines+markers",
+                                    hovertemplate="%{x}<br>" + extract_name(val)
+                                                  + ": $%{y:,.0f}<extra></extra>"
+                                ))
+                            fig_t3.update_layout(
+                                **plotly_layout(height=420,
+                                legend=dict(orientation="h", yanchor="bottom",
+                                            y=1.02, xanchor="right", x=1))
+                            )
+                            st.plotly_chart(fig_t3, use_container_width=True)
+
+                    # ── Trend table + export ──────────────────────────────────
+                    st.markdown("---")
+                    st.markdown('<div class="section-header">Trend Table</div>',
+                                unsafe_allow_html=True)
+
+                    table_cols = ["FY Label", "Revenue Budget", "Revenue YTD",
+                                  "Expenditure Budget", "Expenditure YTD",
+                                  "Encumbrance", "% Spent", "Exp YoY %",
+                                  "Budget FTE", "Actuals FTE"]
+                    tdisp = totals[table_cols].rename(columns={"FY Label": "Fiscal Year"})
+                    st.dataframe(
+                        tdisp.style.format({
+                            "Revenue Budget": "${:,.0f}", "Revenue YTD": "${:,.0f}",
+                            "Expenditure Budget": "${:,.0f}", "Expenditure YTD": "${:,.0f}",
+                            "Encumbrance": "${:,.0f}", "% Spent": "{:.1f}%",
+                            "Exp YoY %": "{:+.1f}%",
+                            "Budget FTE": "{:,.1f}", "Actuals FTE": "{:,.1f}",
+                        }, na_rep="—"),
+                        use_container_width=True,
+                        height=min(500, len(tdisp) * 35 + 60)
+                    )
+                    st.caption("Exports carry numeric values (ready to pivot).")
+
+                    entity_short = (selected_entity.replace(" ", "_").replace("/", "-")
+                                    if selected_entity != "— All Entities —" else "statewide")
+                    period_code = (period_mode.lower().replace(" ", "_")
+                                   if period_mode else "all")
+                    base_name = (f"{entity_short}_fy{fy_key_to_code(yr_lo)}"
+                                 f"-{fy_key_to_code(yr_hi)}_{period_code}_trend")
+
+                    td1, td2 = st.columns(2)
+                    with td1:
+                        st.download_button(
+                            "Trend CSV",
+                            data=totals.drop(columns=["FY"]).to_csv(index=False),
+                            file_name=f"{base_name}.csv",
+                            mime="text/csv", key="tr_dl_csv")
+                    with td2:
+                        st.download_button(
+                            "Trend Excel",
+                            data=to_excel_download(totals.drop(columns=["FY"]), "Trend"),
+                            file_name=f"{base_name}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="tr_dl_xlsx")
+
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # TAB 6: SALARY & BENEFITS
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Salary & Benefits":
 
