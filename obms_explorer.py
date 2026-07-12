@@ -56,6 +56,14 @@ Trends (Jul 2026): new tab. Multi-year view scoped by the sidebar entity,
   20-year statewide trend costs megabytes, not gigabytes. Headline
   revenue/expenditure and FTE trends, fund/function breakdown lines, and
   a numeric trend table with YoY, exportable to CSV/Excel.
+
+Exceptions (Jul 2026): new tab, second in the nav. Statewide compliance
+  sweep for the sidebar's FY + period (entity selection deliberately
+  ignored): function-level over-authority (the NMAC line, including
+  spending against zero loaded authority), non-reimbursable cash-deficit
+  funds, and entities with a budget but no actuals submitted for the
+  period. Per-list CSVs plus a combined three-sheet workbook. Half-cent
+  tolerance keeps float dust from flagging phantom exceptions.
 """
 
 import streamlit as st
@@ -247,7 +255,7 @@ _EMBEDDED_GDRIVE_FILES = {
     "actuals_2122": "1oIwcfntBqCQKjCfKqMwu2AtFsxt0P1u2",
     "actuals_2223": "1WHzdvgqZT_ZjerGZHoqtkv46ScNnPi54",
     "actuals_2324": "15aR7lFEuj-NvF33L22GsWe0guI4Hyzrp",
-    "actuals_2425": "1FZsV_4CKhPhl8kFFdG4IodTv8XRe3_Sz",
+    "actuals_2425": "1In-ryEzywVTauPLb7tzDmbYumyoZhSCW",
     "actuals_2526": "1B1VTimEWzn7m0rY1Y_UjDbobb4dBtzUg",
     "budget_0607": "132sgPwq4mTX2uTk_pJbna_WwM2uGm9P2",
     "budget_0708": "1hxS4Zs8qnkbmtz37Cya8YjFmUdurt2TB",
@@ -470,6 +478,16 @@ def to_excel_download(df: pd.DataFrame, sheet_name: str = "Data") -> bytes:
     return output.getvalue()
 
 
+def to_excel_multi(sheets: dict) -> bytes:
+    """One workbook, one sheet per entry. Uncached — used for small frames
+    (exceptions) where hashing a dict of DataFrames costs more than writing."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=str(name)[:31], index=False)
+    return output.getvalue()
+
+
 def get_unique_values(act_df, bud_df, col):
     """Get sorted unique values for a dimension across both datasets."""
     vals = set()
@@ -517,6 +535,101 @@ def budget_vs_actuals(bud_df: pd.DataFrame, act_df: pd.DataFrame,
                        bva["Adjusted_Budget"].replace(0, np.nan) * 100)
     bva["Name"] = bva[group_col].apply(extract_name)
     return bva.sort_values("Adjusted_Budget", ascending=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEPTIONS CORE (statewide compliance sweeps)
+# ══════════════════════════════════════════════════════════════════════════════
+# All three finders take unscoped (statewide) frames — the exceptions page
+# deliberately ignores the sidebar entity. A half-cent tolerance keeps
+# floating-point dust from flagging phantom exceptions.
+
+def find_authority_exceptions(bud_df: pd.DataFrame, act_df: pd.DataFrame,
+                              tol: float = 0.005) -> pd.DataFrame:
+    """
+    Entity × Function rows (expenditure side) where YTD + encumbrance
+    exceeds adjusted budget authority — the NMAC function-level line.
+    Spending against a function with zero loaded authority is flagged too
+    (Adjusted Budget 0, % Used blank).
+    """
+    dims = ["Budget Entity", "Function"]
+    b = bud_df[bud_df["Account Type"] == "E"] if len(bud_df) > 0 else bud_df
+    a = act_df[act_df["Account Type"] == "E"] if len(act_df) > 0 else act_df
+
+    def _g(df, colmap):
+        if len(df) == 0 or any(d not in df.columns for d in dims):
+            return pd.DataFrame(columns=dims + list(colmap))
+        return df.groupby(dims, dropna=False, observed=True).agg(**colmap).reset_index()
+
+    bg = _g(b, dict(Adjusted_Budget=("Adjusted Amt", "sum")))
+    ag = _g(a, dict(YTD=("Actuals YTDAmount", "sum"),
+                    Encumbrance=("Actuals Encumbrance", "sum")))
+    m = bg.merge(ag, on=dims, how="outer")
+    for c in ["Adjusted_Budget", "YTD", "Encumbrance"]:
+        m[c] = pd.to_numeric(m[c], errors="coerce").fillna(0)
+
+    m["Available"] = m["Adjusted_Budget"] - m["YTD"] - m["Encumbrance"]
+    exc = m[m["Available"] < -tol].copy()
+    exc["Over_By"] = -exc["Available"]
+    exc["Pct_Used"] = ((exc["YTD"] + exc["Encumbrance"])
+                       / exc["Adjusted_Budget"].replace(0, np.nan) * 100)
+    return exc.sort_values("Over_By", ascending=False).reset_index(drop=True)
+
+
+def find_cash_deficit_funds(act_df: pd.DataFrame,
+                            tol: float = 0.005) -> pd.DataFrame:
+    """
+    Entity × Fund rows in NON-REIMBURSABLE funds where expenditure YTD
+    exceeds revenue YTD — the cash-concern list. (Reimbursable funds are
+    excluded: spend-first-reimburse-later is their normal posture.)
+    """
+    dims = ["Budget Entity", "Fund"]
+    cols = dims + ["Revenue_YTD", "Expenditure_YTD", "Net"]
+    if len(act_df) == 0 or any(d not in act_df.columns for d in dims):
+        return pd.DataFrame(columns=cols)
+
+    rev = (act_df[act_df["Account Type"] == "R"]
+           .groupby(dims, dropna=False, observed=True)
+           .agg(Revenue_YTD=("Actuals YTDAmount", "sum")).reset_index())
+    exp = (act_df[act_df["Account Type"] == "E"]
+           .groupby(dims, dropna=False, observed=True)
+           .agg(Expenditure_YTD=("Actuals YTDAmount", "sum")).reset_index())
+    m = rev.merge(exp, on=dims, how="outer")
+    for c in ["Revenue_YTD", "Expenditure_YTD"]:
+        m[c] = pd.to_numeric(m[c], errors="coerce").fillna(0)
+
+    m["Net"] = m["Revenue_YTD"] - m["Expenditure_YTD"]
+    m["Fund_Class"] = m["Fund"].apply(classify_fund)
+    exc = m[(m["Fund_Class"] == "Non-Reimbursable") & (m["Net"] < -tol)].copy()
+    return (exc[cols].sort_values("Net", ascending=True).reset_index(drop=True))
+
+
+def find_missing_actuals(bud_df: pd.DataFrame,
+                         act_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Entities with a loaded budget but ZERO actuals rows for the selected
+    period — the chase list. Expenditure budget included for context and
+    triage order (biggest budgets first).
+    """
+    cols = ["Budget Entity", "Expenditure_Budget"]
+    if len(bud_df) == 0 or "Budget Entity" not in bud_df.columns:
+        return pd.DataFrame(columns=cols)
+
+    all_ents = set(str(x) for x in bud_df["Budget Entity"].dropna().unique())
+    reported = (set(str(x) for x in act_df["Budget Entity"].dropna().unique())
+                if len(act_df) > 0 and "Budget Entity" in act_df.columns else set())
+    missing = sorted(all_ents - reported)
+    if not missing:
+        return pd.DataFrame(columns=cols)
+
+    e = (bud_df[bud_df["Account Type"] == "E"]
+         .groupby("Budget Entity", dropna=False, observed=True)
+         .agg(Expenditure_Budget=("Adjusted Amt", "sum")).reset_index())
+    e["Budget Entity"] = e["Budget Entity"].astype(str)
+    out = pd.DataFrame({"Budget Entity": missing}).merge(e, on="Budget Entity", how="left")
+    out["Expenditure_Budget"] = pd.to_numeric(
+        out["Expenditure_Budget"], errors="coerce").fillna(0)
+    return out.sort_values("Expenditure_Budget", ascending=False).reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1188,7 +1301,7 @@ def main():
 
 
     # ── Tabs ─────────────────────────────────────────────────────────────────────
-    TAB_NAMES = ["Overview", "Budget Authority", "Actuals", "Report Builder", "Trends", "Salary & Benefits"]
+    TAB_NAMES = ["Overview", "Exceptions", "Budget Authority", "Actuals", "Report Builder", "Trends", "Salary & Benefits"]
 
     # NOTE: state lives in the widget key alone. Passing both `index=` (from
     # session state) and `key="active_tab"` triggers Streamlit's "widget
@@ -1411,7 +1524,139 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 2: BUDGET AUTHORITY
+    # TAB 2: EXCEPTIONS
+    # ══════════════════════════════════════════════════════════════════════════════
+    elif st.session_state.active_tab == "Exceptions":
+
+        st.markdown('<div class="section-header">Statewide Exceptions</div>', unsafe_allow_html=True)
+        st.caption(
+            f"Always statewide — the sidebar entity selection doesn't apply here. "
+            f"Scope: all entities · {fy_label} · {period_label}. Exports carry "
+            f"numeric values."
+        )
+
+        # Fresh statewide slices (entity-unscoped), period applied to actuals
+        exc_act = act_raw
+        if selected_period and len(exc_act) > 0:
+            exc_act = exc_act[exc_act["Reporting Period"] == selected_period]
+
+        over = find_authority_exceptions(bud_raw, exc_act)
+        cash = find_cash_deficit_funds(exc_act)
+        missing = find_missing_actuals(bud_raw, exc_act)
+
+        em1, em2, em3, em4 = st.columns(4)
+        em1.metric("Entities Over Authority",
+                   f"{over['Budget Entity'].nunique():,}" if len(over) > 0 else "0")
+        em2.metric("Over-Authority Lines", f"{len(over):,}")
+        em3.metric("Cash-Deficit Funds", f"{len(cash):,}")
+        em4.metric("Missing Actuals", f"{len(missing):,}")
+
+        # ── 1. Over budget authority (function level) ─────────────────────────
+        st.markdown("---")
+        st.markdown('<div class="section-header">Over Budget Authority — Function Level</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "NMAC requires budget authority at the function level. Includes "
+            "spending against functions with no loaded authority (Adjusted "
+            "Budget $0, % Used blank)."
+        )
+        if len(over) > 0:
+            over_disp = over.rename(columns={
+                "Budget Entity": "Entity", "Adjusted_Budget": "Adjusted Budget",
+                "YTD": "YTD Actuals", "Over_By": "Over By", "Pct_Used": "% Used"})
+            st.dataframe(
+                over_disp.style.format({
+                    "Adjusted Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
+                    "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
+                    "Over By": "${:,.0f}", "% Used": "{:.1f}%",
+                }, na_rep="—").map(
+                    lambda v: "color: #c64c43; font-weight: 600"
+                    if isinstance(v, (int, float)) and v < 0 else "",
+                    subset=["Available"]
+                ).map(
+                    lambda v: "color: #c64c43; font-weight: 600"
+                    if isinstance(v, (int, float)) and v > 0 else "",
+                    subset=["Over By"]
+                ),
+                use_container_width=True, height=min(500, len(over_disp) * 35 + 60)
+            )
+            st.download_button(
+                "Over-Authority CSV", data=over.to_csv(index=False),
+                file_name=f"exceptions_over_authority_fy{fy_key_to_code(selected_fy[0])}.csv",
+                mime="text/csv", key="exc_dl_over")
+        else:
+            st.success("No entity exceeds function-level budget authority for this period.")
+
+        # ── 2. Non-reimbursable cash deficits ────────────────────────────────
+        st.markdown("---")
+        st.markdown('<div class="section-header">Non-Reimbursable Cash Deficits</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Non-reimbursable funds where expenditures exceed revenue YTD — the "
+            "cash-concern list. Reimbursable funds are excluded (spend-first, "
+            "reimburse-later is their normal posture)."
+        )
+        if len(cash) > 0:
+            cash_disp = cash.rename(columns={
+                "Budget Entity": "Entity", "Revenue_YTD": "Revenue YTD",
+                "Expenditure_YTD": "Expenditure YTD"})
+            st.dataframe(
+                cash_disp.style.format({
+                    "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}",
+                    "Net": "${:,.0f}",
+                }).map(
+                    lambda v: "color: #c64c43; font-weight: 600"
+                    if isinstance(v, (int, float)) and v < 0 else "",
+                    subset=["Net"]
+                ),
+                use_container_width=True, height=min(500, len(cash_disp) * 35 + 60)
+            )
+            st.download_button(
+                "Cash-Deficit CSV", data=cash.to_csv(index=False),
+                file_name=f"exceptions_cash_deficit_fy{fy_key_to_code(selected_fy[0])}.csv",
+                mime="text/csv", key="exc_dl_cash")
+        else:
+            st.success("No non-reimbursable fund is running a cash deficit for this period.")
+
+        # ── 3. No actuals submitted ──────────────────────────────────────────
+        st.markdown("---")
+        st.markdown('<div class="section-header">No Actuals Submitted</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            f"Entities with a loaded budget but no actuals rows for "
+            f"{period_label} — the chase list, biggest budgets first."
+        )
+        if len(missing) > 0:
+            miss_disp = missing.rename(columns={
+                "Budget Entity": "Entity", "Expenditure_Budget": "Expenditure Budget"})
+            st.dataframe(
+                miss_disp.style.format({"Expenditure Budget": "${:,.0f}"}),
+                use_container_width=True, height=min(500, len(miss_disp) * 35 + 60)
+            )
+            st.download_button(
+                "Missing-Actuals CSV", data=missing.to_csv(index=False),
+                file_name=f"exceptions_missing_actuals_fy{fy_key_to_code(selected_fy[0])}.csv",
+                mime="text/csv", key="exc_dl_missing")
+        else:
+            st.success(f"Every entity with a loaded budget has submitted actuals for {period_label}.")
+
+        # ── Combined workbook ────────────────────────────────────────────────
+        st.markdown("---")
+        period_code = selected_period.lower() if selected_period else "all"
+        st.download_button(
+            "All Exceptions (Excel, 3 sheets)",
+            data=to_excel_multi({
+                "Over Authority": over,
+                "Cash Deficit Funds": cash,
+                "Missing Actuals": missing,
+            }),
+            file_name=f"exceptions_fy{fy_key_to_code(selected_fy[0])}_{period_code}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="exc_dl_all")
+
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # TAB 3: BUDGET AUTHORITY
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Budget Authority":
 
@@ -1703,7 +1948,7 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 3: ACTUALS
+    # TAB 4: ACTUALS
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Actuals":
 
@@ -1881,7 +2126,7 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 4: REPORT BUILDER
+    # TAB 5: REPORT BUILDER
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Report Builder":
 
@@ -2011,7 +2256,7 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 5: TRENDS
+    # TAB 6: TRENDS
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Trends":
 
@@ -2218,7 +2463,7 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 6: SALARY & BENEFITS
+    # TAB 7: SALARY & BENEFITS
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Salary & Benefits":
 
