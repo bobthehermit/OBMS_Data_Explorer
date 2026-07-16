@@ -68,6 +68,10 @@ Exceptions (Jul 2026): new tab, second in the nav. Statewide compliance
 
 import streamlit as st
 import pandas as pd
+try:
+    pd.set_option("mode.string_storage", "python")
+except Exception:
+    pass
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO

@@ -3,5 +3,5 @@ pandas
 plotly
 numpy
 pillow
-pyarrow
+pyarrow<25
 openpyxl
