@@ -319,22 +319,81 @@ FY_LABELS = {k: f"{k-1}–{k}" for k in ALL_FY_KEYS}
 
 
 # ── Column Contracts (used for pruned parquet reads + dtype prep) ────────────
-# Full OBMS string: Fund, Function, Object, Program, Location, Job Class
+# Full OBMS string: Fund, Function, Object, Program, Location, Job Class.
+# This is the report GRAIN and the budget↔actuals join key. Adding a column
+# here changes the row count of every export — attributes go in EXTRA_DIMS.
 OBMS_DIMS = ["Budget Entity", "Fund", "Function", "Object", "Program", "Location", "Job Class"]
-# Filterable dimensions (excludes entity which is global)
-FILTER_DIMS = ["Fund", "Function", "Object", "Program", "Location", "Job Class"]
 
+# ── Attribute dimensions (beyond the OBMS string) ────────────────────────────
+# Columns the parquet carries that describe a row without being part of its
+# account string. To surface a new one that already exists in the parquet,
+# add ONE entry here — the loader, filters, and Report Builder all read this.
+#   sides       fact tables that carry the column natively: "act", "bud"
+#   derive_via  if the attribute is a property of an OBMS dimension (Location
+#               Type is a property of Location), name it; the loader builds a
+#               lookup from the side that has the column and maps it onto the
+#               side that doesn't, so a filter applies to BOTH budget and
+#               actuals. None = actuals-only attribute; filtering it leaves
+#               the budget side untouched (the filter widget says so).
+#   filter      show in the per-tab Dimension Filters expander
+#   report      offer as a row dimension in the Report Builder
+# If the column is NOT in the parquet yet, obms_extract.py has to emit it
+# first; the entry here is still the only app-side change.
+EXTRA_DIMS = {
+    "Location Type": {"sides": ["act"], "derive_via": "Location", "filter": True, "report": True},
+    # Status is one value per entity per quarter (submission workflow state),
+    # so it's a GLOBAL sidebar control, not a per-tab filter — see the
+    # "Actuals status" radio in main(). Still available as a report row dim.
+    "Status":        {"sides": ["act"], "derive_via": None,       "filter": False, "report": True},
+}
+
+# Filterable dimensions (excludes entity which is global)
+FILTER_DIMS = ["Fund", "Function", "Object", "Program", "Location", "Job Class"] + [
+    d for d, spec in EXTRA_DIMS.items() if spec["filter"]
+]
+
+# New measure already in the parquet? Add it to the list below for its side
+# AND to MEASURE_SPECS (Report Builder) — two lines.
 ACTUALS_COLS = OBMS_DIMS + [
     "Account Type", "Reporting Period",
     "Actuals Period Amount", "Actuals YTDAmount", "Actuals Encumbrance", "Actuals FTE",
-]
+] + [d for d, spec in EXTRA_DIMS.items() if "act" in spec["sides"]]
 BUDGET_COLS = OBMS_DIMS + [
     "Account Type",
     "Final Amt", "Final FTE", "Adjustment Amt", "Adjustment FTE",
     "Adjusted Amt", "Adjusted FTE",
-]
+] + [d for d, spec in EXTRA_DIMS.items() if "bud" in spec["sides"]]
 # Repeated-string columns → Categoricals after concat (memory + groupby speed)
-CATEGORICAL_COLS = OBMS_DIMS + ["Account Type", "Reporting Period"]
+CATEGORICAL_COLS = OBMS_DIMS + ["Account Type", "Reporting Period"] + list(EXTRA_DIMS)
+
+
+def enrich_derived_dims(act: pd.DataFrame, bud: pd.DataFrame) -> None:
+    """
+    For each EXTRA_DIMS entry with derive_via, copy the attribute onto the
+    side that lacks it by looking it up on the parent dimension. Runs on
+    plain string columns BEFORE the categorical cast (mapping through a
+    categorical would silently produce NaN for unseen categories).
+    Mutates in place; both frames are freshly concatenated at this point.
+    """
+    for dim, spec in EXTRA_DIMS.items():
+        parent = spec.get("derive_via")
+        if not parent:
+            continue
+        frames = (act, bud)
+        have = [f for f in frames if len(f) > 0 and dim in f.columns and parent in f.columns]
+        need = [f for f in frames if len(f) > 0 and dim not in f.columns and parent in f.columns]
+        if not have or not need:
+            continue
+        # One value per parent key; if the source ever disagrees with itself,
+        # the first non-null wins (drop_duplicates keeps first).
+        lookup = (
+            pd.concat([f[[parent, dim]] for f in have], ignore_index=True)
+            .dropna(subset=[dim])
+            .drop_duplicates(subset=[parent])
+            .set_index(parent)[dim]
+        )
+        for f in need:
+            f[dim] = f[parent].map(lookup)
 
 
 def _download_pruned_parquet(file_key: str, file_id: str) -> pd.DataFrame:
@@ -408,6 +467,10 @@ def get_year_data(fy_keys: tuple[int, ...]) -> tuple[pd.DataFrame, pd.DataFrame]
 
     act = pd.concat(actuals_dfs, ignore_index=True) if actuals_dfs else pd.DataFrame()
     bud = pd.concat(budget_dfs, ignore_index=True) if budget_dfs else pd.DataFrame()
+
+    # Map derived attributes (e.g. Location Type) onto the side that lacks
+    # them so per-tab filters hit budget and actuals alike.
+    enrich_derived_dims(act, bud)
 
     # Cast AFTER concat: concatenating categoricals with unequal category
     # sets silently falls back to object dtype, which defeats the purpose.
@@ -639,7 +702,9 @@ def find_missing_actuals(bud_df: pd.DataFrame,
 # ══════════════════════════════════════════════════════════════════════════════
 # REPORT BUILDER CORE
 # ══════════════════════════════════════════════════════════════════════════════
-REPORT_DIM_OPTIONS = ["Budget Entity"] + FILTER_DIMS
+REPORT_DIM_OPTIONS = ["Budget Entity"] + [
+    d for d in FILTER_DIMS if d not in EXTRA_DIMS or EXTRA_DIMS[d]["report"]
+]
 
 # label: (side, source column, format kind)
 MEASURE_SPECS = {
@@ -1199,6 +1264,22 @@ def main():
         else:
             selected_period = None
 
+        # Actuals status (entity-level submission state for the quarter).
+        # Default to everything so the pre-Status behaviour is preserved;
+        # "Approved only" gives locked numbers for compliance work.
+        status_options = (sorted(act_raw["Status"].dropna().unique())
+                          if len(act_raw) > 0 and "Status" in act_raw.columns else [])
+        if status_options:
+            selected_status = st.radio(
+                "Actuals status",
+                options=["All"] + status_options,
+                horizontal=True,
+                help="Status is set per entity per quarter. 'Approved' is locked; "
+                     "'Submitted' is still under review and can change.",
+            )
+        else:
+            selected_status = "All"
+
         st.markdown("---")
 
         # Entity selector (global — applies to all tabs)
@@ -1231,9 +1312,15 @@ def main():
     if selected_period and len(act_global) > 0:
         act_global = act_global[act_global["Reporting Period"] == selected_period]
 
+    # Apply status filter to actuals (budget has no status — it's a snapshot)
+    if selected_status != "All" and len(act_global) > 0 and "Status" in act_global.columns:
+        act_global = act_global[act_global["Status"] == selected_status]
+
     # Context labels
     fy_label = ", ".join(FY_LABELS.get(k, str(k)) for k in selected_fy)
     period_label = selected_period if selected_period else "All Periods"
+    if selected_status != "All":
+        period_label = f"{period_label} · {selected_status}"
     entity_label = selected_entity if selected_entity != "— All Entities —" else "All Entities"
 
 
@@ -1279,7 +1366,15 @@ def main():
                 for i, dim in enumerate(dims):
                     with fcols[i % 3]:
                         vals = get_unique_values(act_df, bud_df, dim)
-                        selected = st.multiselect(dim, options=vals, default=[], key=f"{tab_key}_{dim}")
+                        # An attribute only actuals carry can't narrow the
+                        # budget side — say so on the widget rather than let
+                        # a budget-vs-actuals view quietly mismatch.
+                        act_only = (
+                            len(bud_df) > 0 and dim not in bud_df.columns
+                            and len(act_df) > 0 and dim in act_df.columns
+                        )
+                        label = f"{dim} (actuals only)" if act_only else dim
+                        selected = st.multiselect(label, options=vals, default=[], key=f"{tab_key}_{dim}")
                         if selected:
                             filters[dim] = selected
 
@@ -1385,7 +1480,7 @@ def main():
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 xaxis_tickangle=-30, yaxis_title="")
             )
-            st.plotly_chart(fig_revexp, use_container_width=True)
+            st.plotly_chart(fig_revexp, width="stretch")
 
         # ── Funds where expenditures exceed revenue ──────────────────────────
         deficit_funds = fund_merged[fund_merged["Net"] < 0].copy()
@@ -1405,7 +1500,7 @@ def main():
                     nr.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
                     st.dataframe(nr.style.format({
                         "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
-                    }), use_container_width=True, height=min(300, len(non_reimb) * 40 + 60))
+                    }), width="stretch", height=min(300, len(non_reimb) * 40 + 60))
                 else:
                     st.success("No non-reimbursable fund deficits.")
 
@@ -1416,7 +1511,7 @@ def main():
                     r.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
                     st.dataframe(r.style.format({
                         "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
-                    }), use_container_width=True, height=min(300, len(reimb) * 40 + 60))
+                    }), width="stretch", height=min(300, len(reimb) * 40 + 60))
                 else:
                     st.info("No reimbursable fund deficits.")
 
@@ -1452,7 +1547,7 @@ def main():
                 }
             ))
             fig_g.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
-            st.plotly_chart(fig_g, use_container_width=True)
+            st.plotly_chart(fig_g, width="stretch")
 
         with g2:
             fig_g2 = go.Figure(go.Indicator(
@@ -1470,7 +1565,7 @@ def main():
                 }
             ))
             fig_g2.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
-            st.plotly_chart(fig_g2, use_container_width=True)
+            st.plotly_chart(fig_g2, width="stretch")
 
         with g3:
             fig_g3 = go.Figure(go.Indicator(
@@ -1489,7 +1584,7 @@ def main():
                 }
             ))
             fig_g3.update_layout(**plotly_layout(height=250, margin=dict(l=30, r=30, t=60, b=20)))
-            st.plotly_chart(fig_g3, use_container_width=True)
+            st.plotly_chart(fig_g3, width="stretch")
 
         # ── Expenditure by Function (treemap) ────────────────────────────────
         st.markdown('<div class="section-header">Expenditure by Function</div>', unsafe_allow_html=True)
@@ -1524,7 +1619,7 @@ def main():
                     hovertemplate="%{label}<br>YTD: $%{value:,.0f}<br>% Spent: %{color:.1f}%<extra></extra>"
                 ))
                 fig_tree.update_layout(**plotly_layout(height=420, margin=dict(l=10, r=10, t=30, b=10)))
-                st.plotly_chart(fig_tree, use_container_width=True)
+                st.plotly_chart(fig_tree, width="stretch")
 
 
     # ══════════════════════════════════════════════════════════════════════════════
@@ -1582,7 +1677,7 @@ def main():
                     if isinstance(v, (int, float)) and v > 0 else "",
                     subset=["Over By"]
                 ),
-                use_container_width=True, height=min(500, len(over_disp) * 35 + 60)
+                width="stretch", height=min(500, len(over_disp) * 35 + 60)
             )
             st.download_button(
                 "Over-Authority CSV", data=over.to_csv(index=False),
@@ -1613,7 +1708,7 @@ def main():
                     if isinstance(v, (int, float)) and v < 0 else "",
                     subset=["Net"]
                 ),
-                use_container_width=True, height=min(500, len(cash_disp) * 35 + 60)
+                width="stretch", height=min(500, len(cash_disp) * 35 + 60)
             )
             st.download_button(
                 "Cash-Deficit CSV", data=cash.to_csv(index=False),
@@ -1635,7 +1730,7 @@ def main():
                 "Budget Entity": "Entity", "Expenditure_Budget": "Expenditure Budget"})
             st.dataframe(
                 miss_disp.style.format({"Expenditure Budget": "${:,.0f}"}),
-                use_container_width=True, height=min(500, len(miss_disp) * 35 + 60)
+                width="stretch", height=min(500, len(miss_disp) * 35 + 60)
             )
             st.download_button(
                 "Missing-Actuals CSV", data=missing.to_csv(index=False),
@@ -1727,7 +1822,7 @@ def main():
                     yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
                 )
-                st.plotly_chart(fig_rev_bud, use_container_width=True)
+                st.plotly_chart(fig_rev_bud, width="stretch")
             else:
                 st.info("No revenue budget data.")
 
@@ -1759,7 +1854,7 @@ def main():
                     yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
                 )
-                st.plotly_chart(fig_exp_bud, use_container_width=True)
+                st.plotly_chart(fig_exp_bud, width="stretch")
             else:
                 st.info("No expenditure budget data.")
 
@@ -1803,7 +1898,7 @@ def main():
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                     title=f"{bud_acct_label} BAR Adjustments by Fund")
                 )
-                st.plotly_chart(fig_bar, use_container_width=True)
+                st.plotly_chart(fig_bar, width="stretch")
 
                 # Detail table
                 bar_detail = bars_data.groupby(["Fund", "Function"], observed=True).agg(
@@ -1822,7 +1917,7 @@ def main():
                         else ("color: #c64c43" if isinstance(v, (int, float)) and v < 0 else ""),
                         subset=["Adjustment"]
                     ),
-                    use_container_width=True, height=min(500, len(bar_detail) * 35 + 60)
+                    width="stretch", height=min(500, len(bar_detail) * 35 + 60)
                 )
             else:
                 st.info("No BAR adjustments found for current filters.")
@@ -1871,7 +1966,7 @@ def main():
                 yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
-            st.plotly_chart(fig_bva, use_container_width=True)
+            st.plotly_chart(fig_bva, width="stretch")
 
             # Full table
             bva_display = bva[[bva_group, "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
@@ -1887,7 +1982,7 @@ def main():
                     lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                     subset=["Available"]
                 ),
-                use_container_width=True, height=min(500, len(bva_display) * 35 + 60)
+                width="stretch", height=min(500, len(bva_display) * 35 + 60)
             )
 
         # ── CSV Export ────────────────────────────────────────────────────────
@@ -1909,7 +2004,7 @@ def main():
             with bc1:
                 st.markdown(f"**Expenditure Budget** — {len(exp_budget_report):,} lines")
                 if len(exp_budget_report) > 0:
-                    st.dataframe(exp_budget_report, use_container_width=True, height=300)
+                    st.dataframe(exp_budget_report, width="stretch", height=300)
                     e1, e2 = st.columns(2)
                     with e1:
                         st.download_button(
@@ -1930,7 +2025,7 @@ def main():
             with bc2:
                 st.markdown(f"**Revenue Budget** — {len(rev_budget_report):,} lines")
                 if len(rev_budget_report) > 0:
-                    st.dataframe(rev_budget_report, use_container_width=True, height=300)
+                    st.dataframe(rev_budget_report, width="stretch", height=300)
                     r1, r2 = st.columns(2)
                     with r1:
                         st.download_button(
@@ -2010,14 +2105,14 @@ def main():
                 ))
                 fig_d.update_layout(**plotly_layout(height=400, showlegend=False,
                                     margin=dict(l=120, r=120, t=10, b=30)))
-                st.plotly_chart(fig_d, use_container_width=True)
+                st.plotly_chart(fig_d, width="stretch")
 
             with sc2:
                 sd = spend_data[[spend_group, "YTD", "Enc", "Pct"]].head(15).copy()
                 sd.columns = [spend_group, "YTD Actuals", "Encumbrance", "% of Total"]
                 st.dataframe(sd.style.format({
                     "YTD Actuals": "${:,.0f}", "Encumbrance": "${:,.0f}", "% of Total": "{:.1f}%"
-                }), use_container_width=True, height=min(400, len(sd) * 35 + 60))
+                }), width="stretch", height=min(400, len(sd) * 35 + 60))
 
         # ── Budget vs Actuals by Function ────────────────────────────────────
         st.markdown("---")
@@ -2048,7 +2143,7 @@ def main():
                 yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
             )
-            st.plotly_chart(fig_fb, use_container_width=True)
+            st.plotly_chart(fig_fb, width="stretch")
 
             st.dataframe(
                 func_m[["Function", "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
@@ -2063,7 +2158,7 @@ def main():
                     lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                     subset=["Available"]
                 ),
-                use_container_width=True, height=min(500, len(func_m) * 35 + 60)
+                width="stretch", height=min(500, len(func_m) * 35 + 60)
             )
 
         # ── CSV Exports ──────────────────────────────────────────────────────
@@ -2087,7 +2182,7 @@ def main():
             with ac1:
                 st.markdown(f"**Expenditure Actuals** — {len(exp_act_report):,} lines")
                 if len(exp_act_report) > 0:
-                    st.dataframe(exp_act_report, use_container_width=True, height=300)
+                    st.dataframe(exp_act_report, width="stretch", height=300)
                     ae1, ae2 = st.columns(2)
                     with ae1:
                         st.download_button(
@@ -2108,7 +2203,7 @@ def main():
             with ac2:
                 st.markdown(f"**Revenue Actuals** — {len(rev_act_report):,} lines")
                 if len(rev_act_report) > 0:
-                    st.dataframe(rev_act_report, use_container_width=True, height=300)
+                    st.dataframe(rev_act_report, width="stretch", height=300)
                     ar1, ar2 = st.columns(2)
                     with ar1:
                         st.download_button(
@@ -2153,7 +2248,7 @@ def main():
                         "Saved report", options=sorted(report_defs),
                         key="rb_saved_pick", label_visibility="collapsed")
                 with sr2:
-                    if st.button("Load", key="rb_load", use_container_width=True):
+                    if st.button("Load", key="rb_load", width="stretch"):
                         d = report_defs.get(picked, {})
                         st.session_state["rb_dims"] = [
                             x for x in d.get("dims", []) if x in REPORT_DIM_OPTIONS]
@@ -2165,7 +2260,7 @@ def main():
                         st.session_state["rb_raw_vals"] = bool(d.get("raw", False))
                         st.rerun()
                 with sr3:
-                    if st.button("Delete", key="rb_delete", use_container_width=True):
+                    if st.button("Delete", key="rb_delete", width="stretch"):
                         report_defs.pop(picked, None)
                         _save_report_defs(report_defs)
                         st.rerun()
@@ -2179,7 +2274,7 @@ def main():
                     placeholder="e.g. Q2 charter burn by fund/function",
                     label_visibility="collapsed")
             with sn2:
-                if st.button("Save", key="rb_save", use_container_width=True) and new_name.strip():
+                if st.button("Save", key="rb_save", width="stretch") and new_name.strip():
                     report_defs[new_name.strip()] = {
                         "dims": st.session_state.get("rb_dims", []),
                         "measures": st.session_state.get("rb_measures", []),
@@ -2235,7 +2330,7 @@ def main():
                 raw=rb_raw_vals, totals=include_totals)
 
             st.markdown(f"**{len(report):,} rows** · {entity_label} · {fy_label} · {period_label}")
-            st.dataframe(report, use_container_width=True, height=500)
+            st.dataframe(report, width="stretch", height=500)
 
             entity_short = (selected_entity.replace(" ", "_").replace("/", "-")
                             if selected_entity != "— All Entities —" else "statewide")
@@ -2349,7 +2444,7 @@ def main():
                         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                     xanchor="right", x=1))
                     )
-                    st.plotly_chart(fig_t1, use_container_width=True)
+                    st.plotly_chart(fig_t1, width="stretch")
 
                     # ── FTE trend ─────────────────────────────────────────────
                     st.markdown("#### FTE")
@@ -2369,7 +2464,7 @@ def main():
                         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                     xanchor="right", x=1))
                     )
-                    st.plotly_chart(fig_t2, use_container_width=True)
+                    st.plotly_chart(fig_t2, width="stretch")
 
                     # ── Breakdown trend (Fund / Function) ─────────────────────
                     st.markdown("#### Breakdown Over Time")
@@ -2418,7 +2513,7 @@ def main():
                                 legend=dict(orientation="h", yanchor="bottom",
                                             y=1.02, xanchor="right", x=1))
                             )
-                            st.plotly_chart(fig_t3, use_container_width=True)
+                            st.plotly_chart(fig_t3, width="stretch")
 
                     # ── Trend table + export ──────────────────────────────────
                     st.markdown("---")
@@ -2438,7 +2533,7 @@ def main():
                             "Exp YoY %": "{:+.1f}%",
                             "Budget FTE": "{:,.1f}", "Actuals FTE": "{:,.1f}",
                         }, na_rep="—"),
-                        use_container_width=True,
+                        width="stretch",
                         height=min(500, len(tdisp) * 35 + 60)
                     )
                     st.caption("Exports carry numeric values (ready to pivot).")
@@ -2559,14 +2654,14 @@ def main():
             ))
             fig_comp.update_layout(**plotly_layout(height=max(200, len(comp) * 40),
                                     yaxis=dict(autorange="reversed"), xaxis_title=""))
-            st.plotly_chart(fig_comp, use_container_width=True)
+            st.plotly_chart(fig_comp, width="stretch")
 
             st.dataframe(comp[["Obj_Category", "Budget", "YTD", "Enc", "Pct", "Pct_Used"]].rename(columns={
                 "Obj_Category": "Category", "Pct": "% of Total Exp", "Pct_Used": "% of Budget Used"
             }).style.format({
                 "Budget": "${:,.0f}", "YTD": "${:,.0f}", "Enc": "${:,.0f}",
                 "% of Total Exp": "{:.1f}%", "% of Budget Used": "{:.1f}%"
-            }), use_container_width=True)
+            }), width="stretch")
 
         # ── FTE Analysis ─────────────────────────────────────────────────────
         st.markdown("---")
@@ -2626,7 +2721,7 @@ def main():
                     yaxis=dict(autorange="reversed", gridcolor="#e5e7eb"),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)),
                 )
-                st.plotly_chart(fig_fte, use_container_width=True)
+                st.plotly_chart(fig_fte, width="stretch")
 
             # Detail table
             fte_display = fte_jc[["Job Class", "Budget_FTE", "Actual_FTE", "FTE_Variance",
@@ -2645,7 +2740,7 @@ def main():
                     else ("color: #245d62" if isinstance(v, (int, float)) and v > 1 else ""),
                     subset=["FTE Variance"]
                 ),
-                use_container_width=True, height=min(500, len(fte_display) * 35 + 60)
+                width="stretch", height=min(500, len(fte_display) * 35 + 60)
             )
 
         # ── Staffing Balance: Function Category ──────────────────────────────
@@ -2685,7 +2780,7 @@ def main():
                 ))
                 fig_staff.update_layout(**plotly_layout(height=400, showlegend=False,
                                         margin=dict(l=120, r=120, t=30, b=30)))
-                st.plotly_chart(fig_staff, use_container_width=True)
+                st.plotly_chart(fig_staff, width="stretch")
 
             with sc2:
                 fc_display = fc[["Func_Category", "Budget_FTE", "Actual_FTE",
@@ -2696,7 +2791,7 @@ def main():
                     "Budget FTE": "{:,.1f}", "Actual FTE": "{:,.1f}",
                     "% of Total FTE": "{:.1f}%",
                     "Salary Budget": "${:,.0f}", "Salary YTD": "${:,.0f}"
-                }), use_container_width=True, height=min(400, len(fc_display) * 35 + 60))
+                }), width="stretch", height=min(400, len(fc_display) * 35 + 60))
 
         # ── Contracted Services ──────────────────────────────────────────────
         st.markdown("---")
@@ -2732,7 +2827,7 @@ def main():
                     lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                     subset=["Available"]
                 ),
-                use_container_width=True, height=min(500, len(con_display) * 35 + 60)
+                width="stretch", height=min(500, len(con_display) * 35 + 60)
             )
         else:
             st.info("No contracted services data available.")

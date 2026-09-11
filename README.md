@@ -10,7 +10,7 @@ colorTo: yellow
 
 sdk: streamlit
 
-sdk_version: "1.44.0"
+sdk_version: "1.63.0"
 
 app_file: obms_explorer.py
 
