@@ -183,6 +183,13 @@ button[data-baseweb="tab"] {
 </style>
 """, unsafe_allow_html=True)
 
+DISCLAIMER = (
+    "This tool was built by Lorenzo Dominguez, pulling from official NMPED "
+    "data sources — it isn't an official department publication itself, and "
+    "hasn't been exhaustively tested. If something looks off, verify against "
+    "source records and let me know: "
+    "[lorenzo.dominguez@ped.nm.gov](mailto:lorenzo.dominguez@ped.nm.gov)."
+)
 
 # ── Plotly Theme (NMPED brand – light mode) ─────────────────────────────────
 _PLOTLY_BASE = dict(
@@ -2834,6 +2841,7 @@ def main():
 
     # Footer
     st.markdown("---")
+    st.info(DISCLAIMER)
     st.caption("New Mexico Public Education Department · School Budget Bureau")
 
 main()
