@@ -64,6 +64,16 @@ Exceptions (Jul 2026): new tab, second in the nav. Statewide compliance
   funds, and entities with a budget but no actuals submitted for the
   period. Per-list CSVs plus a combined three-sheet workbook. Half-cent
   tolerance keeps float dust from flagging phantom exceptions.
+
+Phase 1 polish (Oct 2026): sidebar Entity / Period / Status now stick
+  across fiscal-year changes (sticky_selectbox / sticky_radio: preference
+  kept in session_state, written only by on_change). Exceptions respects
+  the sidebar entity + status instead of always running statewide. Cash
+  deficit list covers ALL funds with a Fund Class column (unmapped prefixes
+  labeled "Unclassified" instead of silently dropped). Gauge formulas are
+  captioned. Report Builder warns, with a row-count funnel, when actuals
+  come back empty; "All" status never filters; sidebar shows when data was
+  actually pulled.
 """
 
 import streamlit as st
@@ -237,7 +247,9 @@ def classify_fund(fund_str):
     for prefix, classification in FUND_CLASSIFICATION.items():
         if code.startswith(prefix):
             return classification
-    return "Other"
+    # Prefixes not in FUND_CLASSIFICATION used to be silently dropped from
+    # the deficit lists. Name them so they stay visible.
+    return "Unclassified"
 
 
 # ── Google Drive File Registry ───────────────────────────────────────────────
@@ -487,6 +499,12 @@ def get_year_data(fy_keys: tuple[int, ...]) -> tuple[pd.DataFrame, pd.DataFrame]
             if c in frame.columns:
                 frame[c] = frame[c].astype("category")
 
+    # Stamp when the data was actually pulled from Drive. cache_resource hands
+    # back this same object until the TTL expires, so .attrs survives reruns;
+    # the sidebar shows it instead of the render time (which said "now" even
+    # when the frames were up to an hour old).
+    act.attrs["loaded_at"] = datetime.now()
+
     return act, bud
 
 
@@ -654,12 +672,13 @@ def find_authority_exceptions(bud_df: pd.DataFrame, act_df: pd.DataFrame,
 def find_cash_deficit_funds(act_df: pd.DataFrame,
                             tol: float = 0.005) -> pd.DataFrame:
     """
-    Entity × Fund rows in NON-REIMBURSABLE funds where expenditure YTD
-    exceeds revenue YTD — the cash-concern list. (Reimbursable funds are
-    excluded: spend-first-reimburse-later is their normal posture.)
+    Entity × Fund rows where expenditure YTD exceeds revenue YTD, across
+    ALL funds, labeled by Fund_Class. Reimbursable funds are included but
+    sorted last: spend-first-reimburse-later is their normal posture, so a
+    deficit there is expected at points in the year, not a red flag.
     """
     dims = ["Budget Entity", "Fund"]
-    cols = dims + ["Revenue_YTD", "Expenditure_YTD", "Net"]
+    cols = dims + ["Fund_Class", "Revenue_YTD", "Expenditure_YTD", "Net"]
     if len(act_df) == 0 or any(d not in act_df.columns for d in dims):
         return pd.DataFrame(columns=cols)
 
@@ -675,8 +694,12 @@ def find_cash_deficit_funds(act_df: pd.DataFrame,
 
     m["Net"] = m["Revenue_YTD"] - m["Expenditure_YTD"]
     m["Fund_Class"] = m["Fund"].apply(classify_fund)
-    exc = m[(m["Fund_Class"] == "Non-Reimbursable") & (m["Net"] < -tol)].copy()
-    return (exc[cols].sort_values("Net", ascending=True).reset_index(drop=True))
+    exc = m[m["Net"] < -tol].copy()
+    # Concern order first, then biggest deficit first within each class.
+    exc["_rank"] = exc["Fund_Class"].map(
+        {"Non-Reimbursable": 0, "Unclassified": 1, "Reimbursable": 2}).fillna(1)
+    return (exc.sort_values(["_rank", "Net"], ascending=[True, True])[cols]
+            .reset_index(drop=True))
 
 
 def find_missing_actuals(bud_df: pd.DataFrame,
@@ -705,6 +728,63 @@ def find_missing_actuals(bud_df: pd.DataFrame,
     out["Expenditure_Budget"] = pd.to_numeric(
         out["Expenditure_Budget"], errors="coerce").fillna(0)
     return out.sort_values("Expenditure_Budget", ascending=False).reset_index(drop=True)
+
+
+# ── Actuals status + empty-actuals diagnostics ──────────────────────────────
+STATUS_ALL = "All"
+
+
+def _norm_status(s: pd.Series) -> pd.Series:
+    """Trim + casefold so 'Submitted', 'submitted ' and 'SUBMITTED' compare
+    equal. Goes through the 'string' dtype so NaN stays <NA> instead of
+    becoming the literal text 'nan' (which a plain astype(str) would do)."""
+    return s.astype("string").str.strip().str.casefold()
+
+
+def status_options_from(act_df: pd.DataFrame) -> list[str]:
+    """Distinct status labels for the radio, whitespace-trimmed. Nulls are
+    not offered as a choice; they are only reachable through 'All'."""
+    if len(act_df) == 0 or "Status" not in act_df.columns:
+        return []
+    vals = act_df["Status"].astype("string").str.strip().dropna().unique()
+    # One radio choice per label regardless of case ('SUBMITTED' and
+    # 'Submitted' filter identically, so offering both would be noise).
+    by_key = {}
+    for v in sorted(v for v in vals if v):
+        by_key.setdefault(v.casefold(), v)
+    return sorted(by_key.values())
+
+
+def apply_status_filter(act_df: pd.DataFrame, choice: str) -> pd.DataFrame:
+    """'All' returns the frame untouched: no mask is built, so null and
+    unexpected status values can't be dropped. Any other choice matches on
+    the normalized label."""
+    if choice == STATUS_ALL or len(act_df) == 0 or "Status" not in act_df.columns:
+        return act_df
+    return act_df[(_norm_status(act_df["Status"]) == choice.strip().casefold()).fillna(False)]
+
+
+def actuals_funnel(act_raw: pd.DataFrame, entity: str | None, period: str | None,
+                   status: str, acct_type: str | None) -> list[tuple[str, int]]:
+    """Row count after each scoping step, in the same order main() applies
+    them. When the Report Builder comes back with no actuals, this shows
+    which step emptied the frame."""
+    steps = []
+    a = act_raw
+    steps.append(("Loaded for FY", len(a)))
+    if entity and len(a) > 0:
+        a = a[a["Budget Entity"] == entity]
+        steps.append(("+ entity", len(a)))
+    if period and len(a) > 0:
+        a = a[a["Reporting Period"] == period]
+        steps.append((f"+ period {period}", len(a)))
+    if status != STATUS_ALL:
+        a = apply_status_filter(a, status)
+        steps.append((f"+ status {status}", len(a)))
+    if acct_type and len(a) > 0 and "Account Type" in a.columns:
+        a = a[a["Account Type"] == acct_type]
+        steps.append((f"+ account type {acct_type}", len(a)))
+    return steps
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1206,6 +1286,66 @@ def classify_function_category(func_str):
     else:
         return "Other"
 
+# ── Sticky widgets ───────────────────────────────────────────────────────────
+# Why this exists: Streamlit reruns the whole script on every click, and a
+# widget's identity includes its options list. The entity/period/status
+# lists differ by fiscal year, so switching FY used to look like a brand-new
+# widget and reset to the default ("All Entities", latest period).
+#
+# The pattern: the user's PREFERENCE lives in its own session-state slot
+# (_pref_<key>) that only the on_change callback writes — callbacks fire on
+# user interaction, never when code sets a value. Each rerun we show the
+# preference if this year's options contain it, else the default, without
+# overwriting the preference. So a charter missing from FY18 comes back when
+# you return to FY26.
+
+def _remember_choice(key: str) -> None:
+    """on_change callback: record what the user actually picked."""
+    st.session_state[f"_pref_{key}"] = st.session_state[key]
+
+
+def _resolve_sticky(key: str, options: list, default, label: str):
+    """Pick the value to show for a sticky widget and seed it into
+    session_state BEFORE the widget is created (Streamlit forbids writing
+    a widget's key after it's instantiated in the same run)."""
+    pref_key, warned_key = f"_pref_{key}", f"_warned_{key}"
+    pref = st.session_state.get(pref_key)
+    if pref is None:                 # never chosen → dynamic default
+        shown = default
+    elif pref in options:
+        shown = pref
+        st.session_state.pop(warned_key, None)
+    else:
+        shown = default
+        # Toast once per missing preference, not on every rerun.
+        if st.session_state.get(warned_key) != pref:
+            st.toast(f"{label}: “{pref}” isn't in this fiscal year — showing "
+                     f"“{default}”. Your choice comes back when it's available.")
+            st.session_state[warned_key] = pref
+    st.session_state[key] = shown
+    return shown
+
+
+def sticky_selectbox(label: str, options: list, key: str, default=None, **kwargs):
+    if not options:
+        return None
+    default = options[0] if default is None else default
+    _resolve_sticky(key, options, default, label)
+    # No index= here: the value comes from session_state, and passing both
+    # triggers Streamlit's "default value + Session State" warning.
+    return st.selectbox(label, options=options, key=key,
+                        on_change=_remember_choice, args=(key,), **kwargs)
+
+
+def sticky_radio(label: str, options: list, key: str, default=None, **kwargs):
+    if not options:
+        return None
+    default = options[0] if default is None else default
+    _resolve_sticky(key, options, default, label)
+    return st.radio(label, options=options, key=key,
+                    on_change=_remember_choice, args=(key,), **kwargs)
+
+
 def main():
     # ══════════════════════════════════════════════════════════════════════════════
     # SIDEBAR: Global Filters (Entity + FY + Period)
@@ -1262,41 +1402,44 @@ def main():
             act_raw["Reporting Period"].dropna().unique()
         ) if len(act_raw) > 0 else []
 
-        if available_periods:
-            selected_period = st.selectbox(
-                "Reporting Period",
-                options=available_periods,
-                index=len(available_periods) - 1,
-                help="YTD amounts are cumulative through this quarter."
-            )
-        else:
-            selected_period = None
+        # Default = latest period in this FY; a period you picked sticks
+        # across FY switches when that year has it.
+        selected_period = sticky_selectbox(
+            "Reporting Period",
+            options=available_periods,
+            key="sb_period",
+            default=available_periods[-1] if available_periods else None,
+            help="YTD amounts are cumulative through this quarter."
+        )
 
         # Actuals status (entity-level submission state for the quarter).
         # Default to everything so the pre-Status behaviour is preserved;
         # "Approved only" gives locked numbers for compliance work.
-        status_options = (sorted(act_raw["Status"].dropna().unique())
-                          if len(act_raw) > 0 and "Status" in act_raw.columns else [])
+        status_options = status_options_from(act_raw)
         if status_options:
-            selected_status = st.radio(
+            selected_status = sticky_radio(
                 "Actuals status",
-                options=["All"] + status_options,
+                options=[STATUS_ALL] + status_options,
+                key="sb_status",
+                default=STATUS_ALL,
                 horizontal=True,
                 help="Status is set per entity per quarter. 'Approved' is locked; "
                      "'Submitted' is still under review and can change.",
             )
         else:
-            selected_status = "All"
+            selected_status = STATUS_ALL
 
         st.markdown("---")
 
         # Entity selector (global — applies to all tabs)
         all_entities = sorted(get_unique_values(act_raw, bud_raw, "Budget Entity"))
-        selected_entity = st.selectbox(
+        selected_entity = sticky_selectbox(
             "Budget Entity",
             options=["— All Entities —"] + all_entities,
-            index=0,
-            help="Select a specific district or charter school, or view all."
+            key="sb_entity",
+            default="— All Entities —",
+            help="Select a specific district or charter school, or view all. "
+                 "Your pick is kept when you change fiscal years."
         )
 
         st.markdown("---")
@@ -1304,7 +1447,9 @@ def main():
         bud_count = len(bud_raw)
         st.caption(f"{act_count:,} actuals · {bud_count:,} budget rows · {len(selected_fy)} FY(s)")
         st.caption("Data source: OBMS")
-        st.caption(f"Loaded: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        loaded_at = act_raw.attrs.get("loaded_at")
+        if loaded_at:
+            st.caption(f"Data pulled: {loaded_at.strftime('%d-%m-%Y %H:%M')} (server time; refreshes hourly)")
 
 
     # ── Apply global entity filter (boolean masks make new frames; the raw
@@ -1320,14 +1465,14 @@ def main():
     if selected_period and len(act_global) > 0:
         act_global = act_global[act_global["Reporting Period"] == selected_period]
 
-    # Apply status filter to actuals (budget has no status — it's a snapshot)
-    if selected_status != "All" and len(act_global) > 0 and "Status" in act_global.columns:
-        act_global = act_global[act_global["Status"] == selected_status]
+    # Apply status filter to actuals (budget has no status — it's a snapshot).
+    # "All" is a no-op inside apply_status_filter, so nulls/odd labels survive.
+    act_global = apply_status_filter(act_global, selected_status)
 
     # Context labels
     fy_label = ", ".join(FY_LABELS.get(k, str(k)) for k in selected_fy)
     period_label = selected_period if selected_period else "All Periods"
-    if selected_status != "All":
+    if selected_status != STATUS_ALL:
         period_label = f"{period_label} · {selected_status}"
     entity_label = selected_entity if selected_entity != "— All Entities —" else "All Entities"
 
@@ -1498,11 +1643,13 @@ def main():
             st.markdown('<div class="section-header">Funds: Expenditures Exceed Revenue</div>', unsafe_allow_html=True)
             c1, c2 = st.columns(2)
 
-            non_reimb = deficit_funds[deficit_funds["Fund_Class"] == "Non-Reimbursable"]
+            # Anything not known to be reimbursable is treated as a cash
+            # concern — unclassified funds used to vanish from both tables.
+            non_reimb = deficit_funds[deficit_funds["Fund_Class"] != "Reimbursable"]
             reimb = deficit_funds[deficit_funds["Fund_Class"] == "Reimbursable"]
 
             with c1:
-                st.markdown("**Non-Reimbursable** _(cash concern)_")
+                st.markdown("**Non-Reimbursable & Unclassified** _(cash concern)_")
                 if len(non_reimb) > 0:
                     nr = non_reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
                     nr.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
@@ -1531,6 +1678,14 @@ def main():
             expected_pct = quarter_num * 25
         else:
             expected_pct = 50
+
+        st.caption(
+            f"Expected pace = quarter × 25% (Q04 → 100%). "
+            f"**% Spent** = Expenditure YTD ÷ Adjusted Expenditure Budget, delta vs. expected pace. "
+            f"**% Committed** = (Expenditure YTD + Encumbrance) ÷ Adjusted Expenditure Budget; red line at 100%. "
+            f"**% Collected** = Revenue YTD ÷ Adjusted Revenue Budget, delta vs. expected pace. "
+            f"Straight-line pace is a rough benchmark — revenue like property tax arrives in lumps."
+        )
 
         exp_pct_spent = (exp_ytd_total / exp_budget_total * 100) if exp_budget_total else 0
         exp_pct_committed = ((exp_ytd_total + exp_enc_total) / exp_budget_total * 100) if exp_budget_total else 0
@@ -1635,27 +1790,36 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════════
     elif st.session_state.active_tab == "Exceptions":
 
-        st.markdown('<div class="section-header">Statewide Exceptions</div>', unsafe_allow_html=True)
+        is_statewide = selected_entity == "— All Entities —"
+        st.markdown(
+            f'<div class="section-header">{"Statewide " if is_statewide else ""}Exceptions</div>',
+            unsafe_allow_html=True)
         st.caption(
-            f"Always statewide — the sidebar entity selection doesn't apply here. "
-            f"Scope: all entities · {fy_label} · {period_label}. Exports carry "
-            f"numeric values."
+            f"Scope: {entity_label} · {fy_label} · {period_label}. "
+            + ("Pick an entity in the sidebar to see just its red flags. "
+               if is_statewide else
+               "Choose “— All Entities —” in the sidebar for the statewide sweep. ")
+            + "Exports carry numeric values."
         )
 
-        # Fresh statewide slices (entity-unscoped), period applied to actuals
-        exc_act = act_raw
-        if selected_period and len(exc_act) > 0:
-            exc_act = exc_act[exc_act["Reporting Period"] == selected_period]
+        # Same scoped frames every other tab uses: entity + period + status
+        # are applied once, upstream, in main(). (This tab used to rebuild
+        # its own statewide slice from act_raw, which is why the entity and
+        # status controls did nothing here.)
+        exc_act, exc_bud = act_global, bud_global
 
-        over = find_authority_exceptions(bud_raw, exc_act)
+        over = find_authority_exceptions(exc_bud, exc_act)
         cash = find_cash_deficit_funds(exc_act)
-        missing = find_missing_actuals(bud_raw, exc_act)
+        missing = find_missing_actuals(exc_bud, exc_act)
+        cash_concern = cash[cash["Fund_Class"] != "Reimbursable"] if len(cash) > 0 else cash
 
         em1, em2, em3, em4 = st.columns(4)
         em1.metric("Entities Over Authority",
                    f"{over['Budget Entity'].nunique():,}" if len(over) > 0 else "0")
         em2.metric("Over-Authority Lines", f"{len(over):,}")
-        em3.metric("Cash-Deficit Funds", f"{len(cash):,}")
+        em3.metric("Cash-Deficit Funds", f"{len(cash_concern):,}",
+                   help="Non-reimbursable and unclassified funds only. Reimbursable "
+                        "deficits appear in the table below but aren't counted.")
         em4.metric("Missing Actuals", f"{len(missing):,}")
 
         # ── 1. Over budget authority (function level) ─────────────────────────
@@ -1694,19 +1858,23 @@ def main():
         else:
             st.success("No entity exceeds function-level budget authority for this period.")
 
-        # ── 2. Non-reimbursable cash deficits ────────────────────────────────
+        # ── 2. Cash deficits (all funds, labeled) ────────────────────────────
         st.markdown("---")
-        st.markdown('<div class="section-header">Non-Reimbursable Cash Deficits</div>',
+        st.markdown('<div class="section-header">Cash Deficits — Expenditures Exceed Revenue</div>',
                     unsafe_allow_html=True)
         st.caption(
-            "Non-reimbursable funds where expenditures exceed revenue YTD — the "
-            "cash-concern list. Reimbursable funds are excluded (spend-first, "
-            "reimburse-later is their normal posture)."
+            "Every fund where expenditures exceed revenue YTD, sorted by concern: "
+            "Non-Reimbursable first, then Unclassified (fund prefix not in the "
+            "classification map), then Reimbursable. A reimbursable deficit is "
+            "usually expected — those funds spend first and draw down "
+            "reimbursement later — so read it against where you are in the year."
         )
-        if len(cash) > 0:
-            cash_disp = cash.rename(columns={
-                "Budget Entity": "Entity", "Revenue_YTD": "Revenue YTD",
-                "Expenditure_YTD": "Expenditure YTD"})
+        hide_reimb = st.checkbox("Hide reimbursable funds", key="exc_hide_reimb")
+        cash_view = cash_concern if hide_reimb else cash
+        if len(cash_view) > 0:
+            cash_disp = cash_view.rename(columns={
+                "Budget Entity": "Entity", "Fund_Class": "Fund Class",
+                "Revenue_YTD": "Revenue YTD", "Expenditure_YTD": "Expenditure YTD"})
             st.dataframe(
                 cash_disp.style.format({
                     "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}",
@@ -1719,11 +1887,11 @@ def main():
                 width="stretch", height=min(500, len(cash_disp) * 35 + 60)
             )
             st.download_button(
-                "Cash-Deficit CSV", data=cash.to_csv(index=False),
+                "Cash-Deficit CSV", data=cash_view.to_csv(index=False),
                 file_name=f"exceptions_cash_deficit_fy{fy_key_to_code(selected_fy[0])}.csv",
                 mime="text/csv", key="exc_dl_cash")
         else:
-            st.success("No non-reimbursable fund is running a cash deficit for this period.")
+            st.success("No fund in scope is running a cash deficit for this period.")
 
         # ── 3. No actuals submitted ──────────────────────────────────────────
         st.markdown("---")
@@ -1732,6 +1900,9 @@ def main():
         st.caption(
             f"Entities with a loaded budget but no actuals rows for "
             f"{period_label} — the chase list, biggest budgets first."
+            + (f" With status set to {selected_status}, this also lists entities "
+               f"that submitted but aren't at that status yet."
+               if selected_status != STATUS_ALL else "")
         )
         if len(missing) > 0:
             miss_disp = missing.rename(columns={
@@ -1757,7 +1928,8 @@ def main():
                 "Cash Deficit Funds": cash,
                 "Missing Actuals": missing,
             }),
-            file_name=f"exceptions_fy{fy_key_to_code(selected_fy[0])}_{period_code}.xlsx",
+            file_name=(f"exceptions_{'statewide' if is_statewide else selected_entity.replace(' ', '_')}"
+                       f"_fy{fy_key_to_code(selected_fy[0])}_{period_code}.xlsx"),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="exc_dl_all")
 
@@ -2336,6 +2508,23 @@ def main():
             report = build_custom_report(
                 rb_act_f, rb_bud_f, row_dims, measures,
                 raw=rb_raw_vals, totals=include_totals)
+
+            # Never let missing actuals pass as blank cells. Only matters
+            # when an actuals measure (or a derived one) is on screen.
+            wants_actuals = any(MEASURE_SPECS[m][0] in ("act", "derived") for m in measures)
+            if wants_actuals and len(rb_bud_f) > 0 and len(rb_act_f) == 0:
+                funnel = actuals_funnel(
+                    act_raw,
+                    selected_entity if selected_entity != "— All Entities —" else None,
+                    selected_period, selected_status, rb_acct_type)
+                funnel_txt = " → ".join(f"{label}: {n:,}" for label, n in funnel)
+                st.warning(
+                    f"No actuals rows for {entity_label} · {fy_label} · {period_label} "
+                    f"· account type {rb_acct_type}. Actuals columns are blank and "
+                    f"Available Balance equals Adjusted Budget — that is missing data, "
+                    f"not zero spending.\n\nRow counts: {funnel_txt}"
+                    + ("\n\n(Dimension filters below may also be excluding rows.)"
+                       if funnel and funnel[-1][1] > 0 else ""))
 
             st.markdown(f"**{len(report):,} rows** · {entity_label} · {fy_label} · {period_label}")
             st.dataframe(report, width="stretch", height=500)
