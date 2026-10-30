@@ -1,5 +1,5 @@
 """
-Phase 1 regression tests for OBMS Financial Explorer.
+Regression tests for OBMS Financial Explorer (Phase 1 + Phase 2).
 
 Run from the repo root (venv active):   python tests/run_tests.py
 
@@ -11,10 +11,22 @@ from streamlit.testing.v1 import AppTest
 
 HARNESS = str(Path(__file__).resolve().parent / "harness.py")
 
-def fresh():
-    at = AppTest.from_file(HARNESS, default_timeout=60); at.run(); return at
+def fresh(**url):
+    """New browser session. Keyword args become the page's ?query=string,
+    as if you'd opened a bookmark."""
+    at = AppTest.from_file(HARNESS, default_timeout=60)
+    for k, v in url.items():
+        at.query_params[k] = v
+    at.run(); return at
 
 def sb(at, key): return at.sidebar.selectbox(key=key)
+
+def qp(at, key):
+    """URL param as a list. AppTest reports single values as ['x'] on
+    Streamlit 1.63 and as 'x' on 1.66 — normalize so tests check meaning,
+    not container type."""
+    v = at.query_params.get(key)
+    return None if v is None else (list(v) if isinstance(v, (list, tuple)) else [v])
 def check(cond, msg):
     print(("PASS " if cond else "FAIL ") + msg); assert cond, msg
 
@@ -70,3 +82,64 @@ check(not at.exception, "Report Builder clean")
 for tab in ["Overview","Budget Authority","Actuals","Salary & Benefits"]:
     at.radio(key="active_tab").set_value(tab).run()
     check(not at.exception, f"{tab} renders ({[str(e.value)[:80] for e in at.exception]})")
+
+
+# ══ Phase 2: bookmarkable views, row order, tab persistence ══════════════════
+print("\n── Phase 2 ──")
+
+# 7. Opening a full report link lands on exactly that report
+at = fresh(fy="2025", e="Tularosa Municipal Schools", p="Q03", s="Approved",
+           tab="Report Builder", d="Object,Fund", m="YTD Actuals,Encumbrance",
+           at="R", tot="1", f_Fund="11000 - Operational")
+check(not at.exception, f"report link loads {[str(e.value)[:120] for e in at.exception]}")
+check(at.sidebar.selectbox(key="sb_fy").value == 2025, "link: fiscal year")
+check(sb(at, "sb_entity").value == "Tularosa Municipal Schools", "link: entity")
+check(sb(at, "sb_period").value == "Q03", "link: period")
+check(at.sidebar.radio(key="sb_status").value == "Approved", "link: status")
+check(at.radio(key="active_tab").value == "Report Builder", "link: tab")
+check(at.multiselect(key="rb_dims").value == ["Object", "Fund"], "link: row dims + order")
+check(at.multiselect(key="rb_measures").value == ["YTD Actuals", "Encumbrance"], "link: measures")
+check(at.radio(key="builder_acct_type").value == "R", "link: account type")
+check(at.checkbox(key="rb_totals").value is True, "link: totals row")
+check(at.multiselect(key="builder_Fund").value == ["11000 - Operational"], "link: fund filter")
+check(qp(at, "d") == ["Object,Fund"], "URL round-trips what it loaded")
+link = at.code[0].value
+check("e=Tularosa" in link and "f_Fund=11000" in link, "share link carries entity + filter")
+
+# 8. A broken or stale link degrades to defaults instead of crashing
+at = fresh(fy="1999", e="No Such School", d="Bogus,Fund", m="Nope",
+           tab="Nope", f_Fund="99999 - Not A Fund", at="X")
+check(not at.exception, f"bad link doesn't crash {[str(e.value)[:120] for e in at.exception]}")
+check(sb(at, "sb_entity").value == "— All Entities —", "bad entity → All Entities")
+check(at.radio(key="active_tab").value == "Overview", "bad tab → Overview")
+at.radio(key="active_tab").set_value("Report Builder").run()
+check(at.multiselect(key="rb_dims").value == ["Fund"], "unknown dims dropped, valid kept")
+check(at.multiselect(key="builder_Fund").value == [], "stale filter value dropped")
+check(not at.exception, "Report Builder clean after bad link")
+
+# 9. ◀ ▶ reorder
+at = fresh(tab="Report Builder")
+at.button(key="rb_right_0").click().run()
+check(at.multiselect(key="rb_dims").value == ["Function", "Fund", "Object"], "▶ moves Fund later")
+at.button(key="rb_left_2").click().run()
+check(at.multiselect(key="rb_dims").value == ["Function", "Object", "Fund"], "◀ moves Object earlier")
+check(qp(at, "d") == ["Function,Object,Fund"], "new order written to URL")
+check(at.button(key="rb_left_0").disabled and at.button(key="rb_right_2").disabled,
+      "end buttons disabled")
+
+# 10. Report Builder settings survive a trip to another tab
+at.multiselect(key="rb_measures").set_value(["YTD Actuals"]).run()
+at.multiselect(key="builder_Fund").set_value(["11000 - Operational"]).run()
+at.radio(key="active_tab").set_value("Overview").run()
+check("d" not in at.query_params, "Overview URL omits report params")
+at.radio(key="active_tab").set_value("Report Builder").run()
+check(at.multiselect(key="rb_measures").value == ["YTD Actuals"], "measures kept across tabs")
+check(at.multiselect(key="builder_Fund").value == ["11000 - Operational"], "filter kept across tabs")
+check(at.multiselect(key="rb_dims").value == ["Function", "Object", "Fund"], "order kept across tabs")
+
+# 11. Untouched period stays dynamic in the URL
+at = fresh()
+sb(at, "sb_entity").set_value("Tularosa Municipal Schools").run()
+check(qp(at, "e") == ["Tularosa Municipal Schools"], "chosen entity written to URL")
+check("p" not in at.query_params, "untouched period not frozen into URL")
+check(not at.exception, "clean")

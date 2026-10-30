@@ -43,10 +43,8 @@ Under-the-hood pass (Jul 2026): performance + maintainability. Analytics
 Report Builder (Jul 2026): new tab. Compose a report from any combination
   of row dimensions (including Budget Entity, for statewide comparisons)
   and measures from both the budget and actuals sides, with derived
-  Available Balance and Burn %. Optional totals row, raw/formatted export,
-  and named report definitions persisted to report_definitions.json next
-  to this file (commit the JSON to ship saved reports to HF Spaces —
-  runtime writes there are ephemeral across rebuilds).
+  Available Balance and Burn %. Optional totals row and raw/formatted
+  export. (Saved report definitions were retired in Phase 2 — see below.)
 
 Trends (Jul 2026): new tab. Multi-year view scoped by the sidebar entity,
   with its own year-range slider and actuals-period control (fixed quarter
@@ -74,6 +72,16 @@ Phase 1 polish (Oct 2026): sidebar Entity / Period / Status now stick
   captioned. Report Builder warns, with a row-count funnel, when actuals
   come back empty; "All" status never filters; sidebar shows when data was
   actually pulled.
+
+Phase 2 (Oct 2026): bookmarkable views. The URL query string now carries
+  the sidebar (fy, e, p, s), the tab, and the full Report Builder setup
+  (d, m, at, tot, raw, f_<dim>), read once when a session starts and
+  rewritten every rerun. A bookmark is the saved report: private to the
+  bookmark owner, survives Space rebuilds, shareable by link. This replaces
+  report_definitions.json, which lived on the Space's disk — shared by
+  every visitor and wiped on every rebuild. Row dimensions reorder with
+  ◀ ▶ buttons. Report Builder settings and filters now survive switching
+  tabs, and filter values a fiscal year doesn't have are dropped quietly.
 """
 
 import streamlit as st
@@ -899,32 +907,6 @@ def build_custom_report(act_df, bud_df, dims, measures, raw=False, totals=False)
     return out
 
 
-# ── Saved report definitions (report_definitions.json next to this file) ────
-# Persist fine locally; on HF Spaces runtime writes survive only until the
-# next rebuild — commit the JSON to ship definitions with the app.
-_REPORT_DEFS_PATH = Path(__file__).parent / "report_definitions.json"
-
-
-def _load_report_defs() -> dict:
-    try:
-        if _REPORT_DEFS_PATH.exists():
-            with open(_REPORT_DEFS_PATH) as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
-
-
-def _save_report_defs(defs: dict) -> None:
-    try:
-        with open(_REPORT_DEFS_PATH, "w") as f:
-            json.dump(defs, f, indent=2)
-    except Exception as e:
-        st.warning(f"Could not save report definitions: {e}")
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # MULTI-YEAR TRENDS CORE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1286,6 +1268,9 @@ def classify_function_category(func_str):
     else:
         return "Other"
 
+TAB_NAMES = ["Overview", "Exceptions", "Budget Authority", "Actuals", "Report Builder", "Trends", "Salary & Benefits"]
+
+
 # ── Sticky widgets ───────────────────────────────────────────────────────────
 # Why this exists: Streamlit reruns the whole script on every click, and a
 # widget's identity includes its options list. The entity/period/status
@@ -1346,7 +1331,182 @@ def sticky_radio(label: str, options: list, key: str, default=None, **kwargs):
                     on_change=_remember_choice, args=(key,), **kwargs)
 
 
+# ── Report Builder state that must survive tab switches ─────────────────────
+# Streamlit garbage-collects a widget's session_state entry at the end of any
+# rerun in which that widget wasn't drawn. Visit Overview, and the Report
+# Builder's dims/measures/filters were deleted — coming back reset them.
+# Re-assigning a key to itself at the top of the run converts it from
+# "widget state" to plain session state, which Streamlit never deletes.
+RB_DEFAULT_DIMS = ["Fund", "Function", "Object"]
+RB_DEFAULT_MEASURES = ["Adjusted Budget", "YTD Actuals", "Encumbrance",
+                       "Available Balance", "Burn % (Act + Enc)"]
+RB_STATE_KEYS = (["rb_dims", "rb_measures", "builder_acct_type", "rb_totals",
+                  "rb_raw_vals", "exc_hide_reimb"]
+                 + [f"builder_{d}" for d in FILTER_DIMS])
+
+
+def keep_widget_state(keys) -> None:
+    for k in keys:
+        if k in st.session_state:
+            st.session_state[k] = st.session_state[k]
+
+
+def clean_multiselect_state(key: str, options: list) -> None:
+    """Drop stored values the options list no longer has (a fund code from
+    another fiscal year, a typo'd URL). A multiselect whose session value
+    isn't in its options raises an error instead of rendering."""
+    if key in st.session_state:
+        allowed = set(options)
+        st.session_state[key] = [v for v in st.session_state[key] if v in allowed]
+
+
+# ── URL state (bookmarkable views) ───────────────────────────────────────────
+# st.query_params is a dict-like view of the browser's ?query=string.
+# Reading it gives what the URL said when the page loaded; assigning to it
+# rewrites the address bar WITHOUT triggering a rerun.
+#
+# Flow: load_url_state() runs once per browser session and seeds the same
+# session_state slots the widgets already use (the sticky _pref_ slots for
+# the sidebar, the widget keys for the Report Builder). write_url_state()
+# runs at the end of every rerun and mirrors current choices back out.
+# Short param names keep links readable:
+#   fy=2026  e=<entity>  p=Q04  s=Approved  tab=Report Builder
+#   d=Fund,Function  m=YTD Actuals,Encumbrance  at=R  tot=1  raw=1
+#   f_Fund=<value>&f_Fund=<value>   (repeat a key for a list)
+QP_SIDEBAR = {"e": "sb_entity", "p": "sb_period", "s": "sb_status"}
+
+
+def _fparam(dim: str) -> str:
+    return "f_" + dim.replace(" ", "_")
+
+
+def load_url_state() -> None:
+    if st.session_state.get("_url_loaded"):
+        return  # after the first run, widgets own the state, not the URL
+    st.session_state["_url_loaded"] = True
+    qp = st.query_params
+
+    # Sidebar → the sticky preference slots, so an entity missing from the
+    # linked FY falls back the same way a click would.
+    if qp.get("fy", "").isdigit() and int(qp["fy"]) in ALL_FY_KEYS:
+        st.session_state["_pref_sb_fy"] = int(qp["fy"])
+    for param, key in QP_SIDEBAR.items():
+        if qp.get(param):
+            st.session_state[f"_pref_{key}"] = qp[param]
+    if qp.get("tab") in TAB_NAMES:
+        st.session_state["active_tab"] = qp["tab"]
+
+    # Report Builder → its widget keys directly (validated against the
+    # known option lists; anything unrecognized is ignored, not an error).
+    if qp.get("d"):
+        dims = [x for x in qp["d"].split(",") if x in REPORT_DIM_OPTIONS]
+        if dims:
+            st.session_state["rb_dims"] = list(dict.fromkeys(dims))
+    if qp.get("m"):
+        meas = [x for x in qp["m"].split(",") if x in MEASURE_SPECS]
+        if meas:
+            st.session_state["rb_measures"] = list(dict.fromkeys(meas))
+    if qp.get("at") in ("E", "R"):
+        st.session_state["builder_acct_type"] = qp["at"]
+    if "tot" in qp:
+        st.session_state["rb_totals"] = qp["tot"] == "1"
+    if "raw" in qp:
+        st.session_state["rb_raw_vals"] = qp["raw"] == "1"
+    for dim in FILTER_DIMS:
+        vals = qp.get_all(_fparam(dim))
+        if vals:
+            st.session_state[f"builder_{dim}"] = vals  # cleaned at render
+
+
+def current_url_params() -> dict:
+    """What the URL should say right now. Sidebar values are written only
+    when you actually chose them (the _pref_ slots), so an untouched period
+    stays 'latest' in a bookmark instead of freezing to today's quarter."""
+    ss = st.session_state
+    params = {}
+    if ss.get("_pref_sb_fy") is not None:
+        params["fy"] = str(ss["_pref_sb_fy"])
+    for param, key in QP_SIDEBAR.items():
+        v = ss.get(f"_pref_{key}")
+        if v is not None and v not in ("— All Entities —", STATUS_ALL):
+            params[param] = str(v)
+    tab = ss.get("active_tab", TAB_NAMES[0])
+    if tab != TAB_NAMES[0]:
+        params["tab"] = tab
+    if tab == "Report Builder":
+        params["d"] = ",".join(ss.get("rb_dims", RB_DEFAULT_DIMS))
+        params["m"] = ",".join(ss.get("rb_measures", RB_DEFAULT_MEASURES))
+        if ss.get("builder_acct_type", "E") != "E":
+            params["at"] = ss["builder_acct_type"]
+        if ss.get("rb_totals"):
+            params["tot"] = "1"
+        if ss.get("rb_raw_vals"):
+            params["raw"] = "1"
+        for dim in FILTER_DIMS:
+            vals = ss.get(f"builder_{dim}") or []
+            if vals:
+                params[_fparam(dim)] = [str(v) for v in vals]
+    return params
+
+
+def write_url_state() -> None:
+    params = current_url_params()
+    # Compare first: rewriting identical params every rerun is wasted work.
+    now = {k: (st.query_params.get_all(k) if isinstance(v, list) else st.query_params.get(k))
+           for k, v in params.items()}
+    if now != params or set(st.query_params.keys()) != set(params):
+        st.query_params.from_dict(params)
+
+
+def share_link() -> str:
+    """Full URL for the current view. st.context.url is the app's own
+    address as the browser sees it — on Hugging Face that's the direct
+    *.hf.space URL (the app runs in an iframe inside the Space page)."""
+    from urllib.parse import urlencode
+    base = (st.context.url or "").split("?")[0]
+    # safe="," keeps d=Fund,Function readable instead of d=Fund%2CFunction
+    qs = urlencode(current_url_params(), doseq=True, safe=",")
+    return f"{base}?{qs}" if qs else base
+
+
+# ── Row-order controls (native ◀ ▶ instead of a drag-and-drop component) ──
+def _move_dim(i: int, step: int) -> None:
+    """on_click callback. Callbacks run BEFORE the rerun, so writing the
+    multiselect's key here is legal — the widget picks it up when drawn."""
+    dims = list(st.session_state.get("rb_dims", []))
+    j = i + step
+    if 0 <= j < len(dims):
+        dims[i], dims[j] = dims[j], dims[i]
+        st.session_state["rb_dims"] = dims
+
+
+def render_dim_order(dims: list) -> None:
+    """One compact '◀ 1. Fund ▶' chip per selected dimension. Index-based
+    button keys are fine: the order list IS the state, and the callback
+    swaps neighbours in it."""
+    if len(dims) < 2:
+        return
+    st.caption("Row order — rows group left to right")
+    # A horizontal container lays children out in a row, each sized to its
+    # content (width="content"), wrapping to a new line when it runs out of
+    # room — no fixed column math, so nothing gets clipped.
+    with st.container(horizontal=True, vertical_alignment="center", gap="medium", wrap=True):
+        for i, d in enumerate(dims):
+            with st.container(horizontal=True, vertical_alignment="center",
+                              gap="small", width="content", border=True):
+                st.button("◀", key=f"rb_left_{i}", on_click=_move_dim, args=(i, -1),
+                          disabled=i == 0, help=f"Move {d} earlier",
+                          type="tertiary", width="content")
+                st.markdown(f"**{i + 1}.** {d}", width="content")
+                st.button("▶", key=f"rb_right_{i}", on_click=_move_dim, args=(i, 1),
+                          disabled=i == len(dims) - 1, help=f"Move {d} later",
+                          type="tertiary", width="content")
+
+
 def main():
+    load_url_state()
+    keep_widget_state(RB_STATE_KEYS)
+
     # ══════════════════════════════════════════════════════════════════════════════
     # SIDEBAR: Global Filters (Entity + FY + Period)
     # ══════════════════════════════════════════════════════════════════════════════
@@ -1377,10 +1537,11 @@ def main():
         st.markdown("---")
 
         fy_options = sorted(ALL_FY_KEYS, reverse=True)
-        selected_fy = [st.selectbox(
+        selected_fy = [sticky_selectbox(
             "Fiscal Year",
             options=fy_options,
-            index=0,
+            key="sb_fy",
+            default=fy_options[0],
             format_func=lambda x: FY_LABELS.get(x, str(x))
         )]
 
@@ -1509,7 +1670,8 @@ def main():
             for dim in dims:
                 with cols[col_idx % len(cols)]:
                     vals = get_unique_values(act_df, bud_df, dim)
-                    selected = st.multiselect(dim, options=vals, default=[], key=f"{tab_key}_{dim}")
+                    clean_multiselect_state(f"{tab_key}_{dim}", vals)
+                    selected = st.multiselect(dim, options=vals, key=f"{tab_key}_{dim}")
                     if selected:
                         filters[dim] = selected
                 col_idx += 1
@@ -1527,7 +1689,8 @@ def main():
                             and len(act_df) > 0 and dim in act_df.columns
                         )
                         label = f"{dim} (actuals only)" if act_only else dim
-                        selected = st.multiselect(label, options=vals, default=[], key=f"{tab_key}_{dim}")
+                        clean_multiselect_state(f"{tab_key}_{dim}", vals)
+                        selected = st.multiselect(label, options=vals, key=f"{tab_key}_{dim}")
                         if selected:
                             filters[dim] = selected
 
@@ -1553,7 +1716,6 @@ def main():
 
 
     # ── Tabs ─────────────────────────────────────────────────────────────────────
-    TAB_NAMES = ["Overview", "Exceptions", "Budget Authority", "Actuals", "Report Builder", "Trends", "Salary & Benefits"]
 
     # NOTE: state lives in the widget key alone. Passing both `index=` (from
     # session state) and `key="active_tab"` triggers Streamlit's "widget
@@ -2417,75 +2579,38 @@ def main():
             "statewide comparisons."
         )
 
-        # ── Saved definitions (rendered BEFORE the config widgets so Load can
-        #    set their session-state keys and rerun cleanly) ──────────────────
-        report_defs = _load_report_defs()
-        with st.expander("Saved reports", expanded=False):
-            if report_defs:
-                sr1, sr2, sr3 = st.columns([3, 1, 1])
-                with sr1:
-                    picked = st.selectbox(
-                        "Saved report", options=sorted(report_defs),
-                        key="rb_saved_pick", label_visibility="collapsed")
-                with sr2:
-                    if st.button("Load", key="rb_load", width="stretch"):
-                        d = report_defs.get(picked, {})
-                        st.session_state["rb_dims"] = [
-                            x for x in d.get("dims", []) if x in REPORT_DIM_OPTIONS]
-                        st.session_state["rb_measures"] = [
-                            m for m in d.get("measures", []) if m in MEASURE_SPECS]
-                        if d.get("account_type") in ("E", "R"):
-                            st.session_state["builder_acct_type"] = d["account_type"]
-                        st.session_state["rb_totals"] = bool(d.get("totals", False))
-                        st.session_state["rb_raw_vals"] = bool(d.get("raw", False))
-                        st.rerun()
-                with sr3:
-                    if st.button("Delete", key="rb_delete", width="stretch"):
-                        report_defs.pop(picked, None)
-                        _save_report_defs(report_defs)
-                        st.rerun()
-            else:
-                st.caption("No saved reports yet — configure one below and save it.")
-
-            sn1, sn2 = st.columns([3, 1])
-            with sn1:
-                new_name = st.text_input(
-                    "Save current configuration as", key="rb_name",
-                    placeholder="e.g. Q2 charter burn by fund/function",
-                    label_visibility="collapsed")
-            with sn2:
-                if st.button("Save", key="rb_save", width="stretch") and new_name.strip():
-                    report_defs[new_name.strip()] = {
-                        "dims": st.session_state.get("rb_dims", []),
-                        "measures": st.session_state.get("rb_measures", []),
-                        "account_type": st.session_state.get("builder_acct_type", "E"),
-                        "totals": st.session_state.get("rb_totals", False),
-                        "raw": st.session_state.get("rb_raw_vals", False),
-                    }
-                    _save_report_defs(report_defs)
-                    st.success(f"Saved '{new_name.strip()}'")
+        # ── Link to this report (replaces the old "Saved reports") ───────────
+        with st.expander("🔗 Link to this report", expanded=False):
+            st.code(share_link(), language=None, wrap_lines=True)
+            st.caption(
+                "This link reproduces this exact report — sidebar scope, rows, "
+                "measures, filters. Copy it (icon at right), bookmark it, or send "
+                "it. It always shows current data. On Hugging Face, the browser "
+                "bar shows the Space page, which doesn't carry settings, so use "
+                "this link — or open the app directly at its .hf.space address, "
+                "where the address bar updates as you work.")
 
         # ── Configuration ────────────────────────────────────────────────────
-        # Seed defaults via session state (not widget default=) so Load can
-        # write these keys without the default-vs-session-state warning.
-        st.session_state.setdefault("rb_dims", ["Fund", "Function", "Object"])
-        st.session_state.setdefault(
-            "rb_measures",
-            ["Adjusted Budget", "YTD Actuals", "Encumbrance",
-             "Available Balance", "Burn % (Act + Enc)"])
+        # Seed defaults via session state (not widget default=) so the URL
+        # loader and the ◀ ▶ callbacks can write these keys without the
+        # default-vs-session-state warning.
+        st.session_state.setdefault("rb_dims", list(RB_DEFAULT_DIMS))
+        st.session_state.setdefault("rb_measures", list(RB_DEFAULT_MEASURES))
 
         cfg1, cfg2 = st.columns([2, 3])
         with cfg1:
             row_dims = st.multiselect(
-                "Row dimensions (in order)", options=REPORT_DIM_OPTIONS,
+                "Row dimensions", options=REPORT_DIM_OPTIONS,
                 key="rb_dims",
-                help="Rows group left-to-right in the order you select them.")
+                help="Pick the dimensions here; set their order with ◀ ▶ below.")
         with cfg2:
             measures = st.multiselect(
                 "Measures", options=list(MEASURE_SPECS), key="rb_measures",
                 help="Columns appear in the order you select them. Available "
                      "Balance and Burn % derive from Adjusted Budget, YTD, and "
                      "Encumbrance even when those aren't displayed.")
+
+        render_dim_order(row_dims)
 
         rb_act_f, rb_bud_f, rb_acct_type = render_tab_filters(
             "builder", act_global, bud_global, dims=FILTER_DIMS, show_acct_type=True
@@ -3030,6 +3155,8 @@ def main():
             st.info("No contracted services data available.")
 
     # Footer
+    write_url_state()
+
     st.markdown("---")
     st.info(DISCLAIMER)
     st.caption("New Mexico Public Education Department · School Budget Bureau")
