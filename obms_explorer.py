@@ -528,16 +528,19 @@ def get_year_data(fy_keys: tuple[int, ...]) -> tuple[pd.DataFrame, pd.DataFrame]
 
 # ── Helper Functions ─────────────────────────────────────────────────────────
 def fmt_currency(val, compact=False):
+    """$1,234 / -$1,234 (sign before the dollar sign, as OBMS shows it).
+    Formatting the absolute value and prepending the sign avoids "$-1,234"."""
     if pd.isna(val):
         return "$0"
+    sign, v = ("-" if val < 0 else ""), abs(val)
     if compact:
-        if abs(val) >= 1_000_000_000:
-            return f"${val/1_000_000_000:,.1f}B"
-        if abs(val) >= 1_000_000:
-            return f"${val/1_000_000:,.1f}M"
-        if abs(val) >= 1_000:
-            return f"${val/1_000:,.0f}K"
-    return f"${val:,.0f}"
+        if v >= 1_000_000_000:
+            return f"{sign}${v/1_000_000_000:,.1f}B"
+        if v >= 1_000_000:
+            return f"{sign}${v/1_000_000:,.1f}M"
+        if v >= 1_000:
+            return f"{sign}${v/1_000:,.0f}K"
+    return f"{sign}${v:,.0f}"
 
 
 def fmt_acct_currency(val):
@@ -1959,7 +1962,7 @@ def main():
                     nr = non_reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
                     nr.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
                     st.dataframe(nr.style.format({
-                        "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
+                        "Revenue YTD": fmt_currency, "Expenditure YTD": fmt_currency, "Net": fmt_currency
                     }), width="stretch", height=min(300, len(non_reimb) * 40 + 60))
                 else:
                     st.success("No non-reimbursable fund deficits.")
@@ -1970,7 +1973,7 @@ def main():
                     r = reimb[["Fund", "Revenue_YTD", "Expenditure_YTD", "Net"]].copy()
                     r.columns = ["Fund", "Revenue YTD", "Expenditure YTD", "Net"]
                     st.dataframe(r.style.format({
-                        "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}", "Net": "${:,.0f}"
+                        "Revenue YTD": fmt_currency, "Expenditure YTD": fmt_currency, "Net": fmt_currency
                     }), width="stretch", height=min(300, len(reimb) * 40 + 60))
                 else:
                     st.info("No reimbursable fund deficits.")
@@ -2179,9 +2182,9 @@ def main():
                 "YTD": "YTD Actuals", "Over_By": "Over By", "Pct_Used": "% Used"})
             st.dataframe(
                 over_disp.style.format({
-                    "Adjusted Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
-                    "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
-                    "Over By": "${:,.0f}", "% Used": "{:.1f}%",
+                    "Adjusted Budget": fmt_currency, "YTD Actuals": fmt_currency,
+                    "Encumbrance": fmt_currency, "Available": fmt_currency,
+                    "Over By": fmt_currency, "% Used": "{:.1f}%",
                 }, na_rep="—").map(
                     lambda v: "color: #c64c43; font-weight: 600"
                     if isinstance(v, (int, float)) and v < 0 else "",
@@ -2219,8 +2222,8 @@ def main():
                 "Revenue_YTD": "Revenue YTD", "Expenditure_YTD": "Expenditure YTD"})
             st.dataframe(
                 cash_disp.style.format({
-                    "Revenue YTD": "${:,.0f}", "Expenditure YTD": "${:,.0f}",
-                    "Net": "${:,.0f}",
+                    "Revenue YTD": fmt_currency, "Expenditure YTD": fmt_currency,
+                    "Net": fmt_currency,
                 }).map(
                     lambda v: "color: #c64c43; font-weight: 600"
                     if isinstance(v, (int, float)) and v < 0 else "",
@@ -2250,7 +2253,7 @@ def main():
             miss_disp = missing.rename(columns={
                 "Budget Entity": "Entity", "Expenditure_Budget": "Expenditure Budget"})
             st.dataframe(
-                miss_disp.style.format({"Expenditure Budget": "${:,.0f}"}),
+                miss_disp.style.format({"Expenditure Budget": fmt_currency}),
                 width="stretch", height=min(500, len(miss_disp) * 35 + 60)
             )
             st.download_button(
@@ -2432,8 +2435,8 @@ def main():
 
                 st.dataframe(
                     bar_detail.style.format({
-                        "Beginning": "${:,.0f}", "Adjustment": "${:,.0f}",
-                        "Adjusted": "${:,.0f}", "FTE_Adj": "{:,.2f}"
+                        "Beginning": fmt_currency, "Adjustment": fmt_currency,
+                        "Adjusted": fmt_currency, "FTE_Adj": "{:,.2f}"
                     }).map(
                         lambda v: "color: #245d62" if isinstance(v, (int, float)) and v > 0
                         else ("color: #c64c43" if isinstance(v, (int, float)) and v < 0 else ""),
@@ -2497,8 +2500,8 @@ def main():
                                 "Available", "% Used", "Budget FTE", "Actual FTE"]
             st.dataframe(
                 bva_display.style.format({
-                    "Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
-                    "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
+                    "Budget": fmt_currency, "YTD Actuals": fmt_currency,
+                    "Encumbrance": fmt_currency, "Available": fmt_currency,
                     "% Used": "{:.1f}%", "Budget FTE": "{:,.1f}", "Actual FTE": "{:,.1f}"
                 }).map(
                     lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
@@ -2624,13 +2627,16 @@ def main():
                 Enc=("Actuals Encumbrance", "sum"),
             ).reset_index()
             spend_data["Name"] = spend_data[spend_group].apply(extract_name)
-            spend_data = spend_data[spend_data["YTD"] > 0].sort_values("YTD", ascending=False)
+            # The table keeps negative rows (a large negative is as much an
+            # outlier as a large positive); only all-zero rows are dropped.
+            # A donut can't draw negative slices, so it filters them itself.
+            spend_data = spend_data[spend_data["YTD"] != 0].sort_values("YTD", ascending=False)
             total_spend = spend_data["YTD"].sum()
-            spend_data["Pct"] = spend_data["YTD"] / total_spend * 100
+            spend_data["Pct"] = spend_data["YTD"] / total_spend * 100 if total_spend else np.nan
 
             sc1, sc2 = st.columns([2, 3])
             with sc1:
-                top_donut = spend_data.head(10)
+                top_donut = spend_data[spend_data["YTD"] > 0].head(10)
                 fig_d = go.Figure(go.Pie(
                     labels=top_donut["Name"], values=top_donut["YTD"],
                     hole=0.35, textinfo="label+percent", textposition="outside",
@@ -2650,7 +2656,7 @@ def main():
                 # on_select="rerun" turns the grid into an input: ticking a
                 # row reruns the script and the event says which row.
                 spend_event = st.dataframe(sd.style.format({
-                    "YTD Actuals": "${:,.0f}", "Encumbrance": "${:,.0f}", "% of Total": "{:.1f}%"
+                    "YTD Actuals": fmt_currency, "Encumbrance": fmt_currency, "% of Total": "{:.1f}%"
                 }), width="stretch", height=min(400, len(sd) * 35 + 60),
                     on_select="rerun", selection_mode="single-row",
                     key=f"act_spend_tbl_{spend_group}")
@@ -2700,8 +2706,8 @@ def main():
             }).reset_index(drop=True)
             func_event = st.dataframe(
                 func_tbl.style.format({
-                    "Adjusted Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
-                    "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
+                    "Adjusted Budget": fmt_currency, "YTD Actuals": fmt_currency,
+                    "Encumbrance": fmt_currency, "Available": fmt_currency,
                     "% Used (Act+Enc)": "{:.1f}%"
                 }).map(
                     lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
@@ -3076,9 +3082,9 @@ def main():
                     tdisp = totals[table_cols].rename(columns={"FY Label": "Fiscal Year"})
                     st.dataframe(
                         tdisp.style.format({
-                            "Revenue Budget": "${:,.0f}", "Revenue YTD": "${:,.0f}",
-                            "Expenditure Budget": "${:,.0f}", "Expenditure YTD": "${:,.0f}",
-                            "Encumbrance": "${:,.0f}", "% Spent": "{:.1f}%",
+                            "Revenue Budget": fmt_currency, "Revenue YTD": fmt_currency,
+                            "Expenditure Budget": fmt_currency, "Expenditure YTD": fmt_currency,
+                            "Encumbrance": fmt_currency, "% Spent": "{:.1f}%",
                             "Exp YoY %": "{:+.1f}%",
                             "Budget FTE": "{:,.1f}", "Actuals FTE": "{:,.1f}",
                         }, na_rep="—"),
@@ -3208,7 +3214,7 @@ def main():
             st.dataframe(comp[["Obj_Category", "Budget", "YTD", "Enc", "Pct", "Pct_Used"]].rename(columns={
                 "Obj_Category": "Category", "Pct": "% of Total Exp", "Pct_Used": "% of Budget Used"
             }).style.format({
-                "Budget": "${:,.0f}", "YTD": "${:,.0f}", "Enc": "${:,.0f}",
+                "Budget": fmt_currency, "YTD": fmt_currency, "Enc": fmt_currency,
                 "% of Total Exp": "{:.1f}%", "% of Budget Used": "{:.1f}%"
             }), width="stretch")
 
@@ -3282,8 +3288,8 @@ def main():
             st.dataframe(
                 fte_display.style.format({
                     "Budget FTE": "{:,.2f}", "Actual FTE": "{:,.2f}", "FTE Variance": "{:+,.2f}",
-                    "Avg Salary (Budget)": "${:,.0f}", "Avg Salary (Actual)": "${:,.0f}",
-                    "Total Budget": "${:,.0f}", "Total YTD": "${:,.0f}"
+                    "Avg Salary (Budget)": fmt_currency, "Avg Salary (Actual)": fmt_currency,
+                    "Total Budget": fmt_currency, "Total YTD": fmt_currency
                 }).map(
                     lambda v: "color: #c64c43" if isinstance(v, (int, float)) and v < -1
                     else ("color: #245d62" if isinstance(v, (int, float)) and v > 1 else ""),
@@ -3339,7 +3345,7 @@ def main():
                 st.dataframe(fc_display.style.format({
                     "Budget FTE": "{:,.1f}", "Actual FTE": "{:,.1f}",
                     "% of Total FTE": "{:.1f}%",
-                    "Salary Budget": "${:,.0f}", "Salary YTD": "${:,.0f}"
+                    "Salary Budget": fmt_currency, "Salary YTD": fmt_currency
                 }), width="stretch", height=min(400, len(fc_display) * 35 + 60))
 
         # ── Contracted Services ──────────────────────────────────────────────
@@ -3369,8 +3375,8 @@ def main():
                                 "Encumbrance", "Available", "% Used"]
             st.dataframe(
                 con_display.style.format({
-                    "Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
-                    "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
+                    "Budget": fmt_currency, "YTD Actuals": fmt_currency,
+                    "Encumbrance": fmt_currency, "Available": fmt_currency,
                     "% Used": "{:.1f}%"
                 }).map(
                     lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",

@@ -76,7 +76,7 @@ w = [w.value for w in at.warning if "No actuals rows" in w.value][0]
 print("   ", w.split("Row counts: ")[1].split("\n")[0])
 sb(at, "sb_entity").set_value("Tularosa Municipal Schools").run()
 check(not any("No actuals rows" in w.value for w in at.warning), "no warning when actuals exist")
-check(not at.exception, "Report Builder clean")
+check(not at.exception, "PODhoc clean")
 
 # 6. every tab renders
 for tab in ["Overview","Budget Authority","Actuals","Salary & Benefits"]:
@@ -115,7 +115,7 @@ check(at.radio(key="active_tab").value == "Overview", "bad tab → Overview")
 at.radio(key="active_tab").set_value("PODhoc").run()
 check(at.multiselect(key="rb_dims").value == ["Fund"], "unknown dims dropped, valid kept")
 check(at.multiselect(key="builder_Fund").value == [], "stale filter value dropped")
-check(not at.exception, "Report Builder clean after bad link")
+check(not at.exception, "PODhoc clean after bad link")
 
 # 9. ◀ ▶ reorder
 at = fresh(tab="PODhoc")
@@ -127,7 +127,7 @@ check(qp(at, "d") == ["Function,Object,Fund"], "new order written to URL")
 check(at.button(key="rb_left_0").disabled and at.button(key="rb_right_2").disabled,
       "end buttons disabled")
 
-# 10. Report Builder settings survive a trip to another tab
+# 10. PODhoc settings survive a trip to another tab
 at.multiselect(key="rb_measures").set_value(["YTD Actuals"]).run()
 at.multiselect(key="builder_Fund").set_value(["11000 - Operational"]).run()
 at.radio(key="active_tab").set_value("Overview").run()
@@ -216,5 +216,14 @@ at.radio(key="act_spend_group").set_value("Budget Entity").run()
 sb(at, "sb_entity").set_value("Tularosa Municipal Schools").run()
 check(not at.exception, f"entity pick with entity grouping doesn't crash {[str(e.value)[:120] for e in at.exception]}")
 check(at.radio(key="act_spend_group").value == "Fund", "grouping falls back to Fund")
+
+# 18. Negatives read -$1,234 (sign first), never $-1,234
+ns = {}
+src = (Path(__file__).resolve().parent.parent / "obms_explorer.py").read_text()
+start = src.index("def fmt_currency"); end = src.index("def fmt_acct_currency")
+exec("import pandas as pd\n" + src[start:end], ns)   # run just that one function
+check(ns["fmt_currency"](-44_600_000_000, compact=True) == "-$44.6B", "compact negative is -$44.6B")
+check(ns["fmt_currency"](-1234.4) == "-$1,234", "plain negative is -$1,234")
+check(ns["fmt_currency"](1234.4) == "$1,234", "positive unchanged")
 
 print("\nAll checks passed.")
