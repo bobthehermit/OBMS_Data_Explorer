@@ -82,6 +82,16 @@ Phase 2 (Oct 2026): bookmarkable views. The URL query string now carries
   every visitor and wiped on every rebuild. Row dimensions reorder with
   ◀ ▶ buttons. Report Builder settings and filters now survive switching
   tabs, and filter values a fiscal year doesn't have are dropped quietly.
+
+Phase 3 (Nov 2026): drill-down. Report Builder is renamed PODhoc and moved
+  to the second tab (old ?tab=Report Builder bookmarks still open it).
+  Report tables now hold real numbers and let the browser format them, so
+  clicking a column header sorts by value — they used to hold formatted
+  text, which sorts character by character ("$999.99" above
+  "$998,870.31"). Downloads keep the accounting-string format. Overview
+  gains a By Budget Entity table (statewide scope); Actuals' Spend
+  Distribution can group by Budget Entity; and clicking a row in those
+  tables opens a drill-down panel with a one-click hand-off to PODhoc.
 """
 
 import streamlit as st
@@ -893,10 +903,13 @@ def build_custom_report(act_df, bud_df, dims, measures, raw=False, totals=False)
     if tot_row is not None:
         out = pd.concat([out, pd.DataFrame([tot_row])], ignore_index=True)
 
-    if raw:
-        return out
+    return out if raw else format_custom_report(out)
 
-    for m in measures:
+
+def format_custom_report(report: pd.DataFrame) -> pd.DataFrame:
+    """Numeric custom report → formatted strings (for downloads)."""
+    out = report.copy()
+    for m in [c for c in out.columns if c in MEASURE_SPECS]:
         kind = MEASURE_SPECS[m][2]
         if kind == "money":
             out[m] = out[m].apply(lambda v: "" if pd.isna(v) else fmt_acct_currency(v))
@@ -905,6 +918,54 @@ def build_custom_report(act_df, bud_df, dims, measures, raw=False, totals=False)
         else:  # pct
             out[m] = out[m].apply(lambda v: "" if pd.isna(v) else f"{float(v):.2f}%")
     return out
+
+
+# ── On-screen number formatting that keeps columns sortable ─────────────────
+# A table cell can be TEXT that looks like a number ("$998,870.31") or a real
+# NUMBER the browser merely displays with a format. Sorting text compares
+# character by character, so "$999.99" lands above "$998,870.31" (the 4th
+# character, 9, beats 8). column_config leaves the DataFrame numeric and
+# tells Streamlit's grid how to draw each cell — sorting then uses the value.
+def numeric_column_config(df: pd.DataFrame) -> dict:
+    """Display format per numeric column, inferred from the column name:
+    FTE → 2 decimals, % → 2 decimals with a percent sign, else dollars."""
+    cfg = {}
+    for col in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        if "FTE" in col:
+            cfg[col] = st.column_config.NumberColumn(format="%.2f")
+        elif "%" in col:
+            cfg[col] = st.column_config.NumberColumn(format="%.2f%%")
+        else:
+            cfg[col] = st.column_config.NumberColumn(format="dollar")
+    return cfg
+
+
+# ── Drill-down ───────────────────────────────────────────────────────────────
+DRILL_DIMS = ["Budget Entity", "Fund", "Function", "Object"]
+_BVA_BUD_COLS = ["Adjusted Amt", "Adjusted FTE"]
+_BVA_ACT_COLS = ["Actuals YTDAmount", "Actuals Encumbrance", "Actuals FTE"]
+
+
+def drill_breakdown(act_df: pd.DataFrame, bud_df: pd.DataFrame,
+                    dim: str, value, by: str) -> pd.DataFrame:
+    """Rows where `dim` == `value`, re-grouped by `by`, largest YTD first.
+    Example: dim="Function", value="2100 - Support Services-Students",
+    by="Budget Entity" answers "who reported the money in function 2100?"."""
+    def _slice(df, measure_cols):
+        # A side with no rows (or no columns at all, when nothing loaded)
+        # becomes an empty frame that still has the columns groupby needs.
+        if len(df) == 0 or dim not in df.columns or by not in df.columns:
+            return pd.DataFrame(columns=[by] + measure_cols).astype(
+                {c: "float64" for c in measure_cols})
+        return df[df[dim] == value]
+
+    bva = budget_vs_actuals(_slice(bud_df, _BVA_BUD_COLS),
+                            _slice(act_df, _BVA_ACT_COLS), by)
+    total = bva["YTD_Actuals"].sum()
+    bva["Pct_of_YTD"] = bva["YTD_Actuals"] / total * 100 if total else np.nan
+    return bva.sort_values("YTD_Actuals", ascending=False).reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1082,14 +1143,17 @@ def build_budget_report(bud_df, entity_name, account_type, raw=False):
     report["Adjusted Budget"] = agg["adj_budget"]
     report["Adjusted FTE"] = agg["adjusted_fte"]
 
-    if raw:
-        return report
+    return report if raw else format_budget_report(report)
 
+
+def format_budget_report(report: pd.DataFrame) -> pd.DataFrame:
+    """Numeric budget report → accounting-formatted strings (for downloads).
+    Works on a copy so the numeric frame stays usable for on-screen sorting."""
+    report = report.copy()
     for col in ["Beginning Budget", "Adjustment Amount", "Adjusted Budget"]:
         report[col] = report[col].apply(fmt_acct_currency)
     for col in ["Beginning FTE", "Adjustment FTE", "Adjusted FTE"]:
-        report[col] = report[col].apply(lambda v: f"{v:.2f}")
-
+        report[col] = report[col].apply(lambda v: "" if pd.isna(v) else f"{v:.2f}")
     return report
 
 
@@ -1200,9 +1264,12 @@ def build_actuals_report(act_df, bud_df, entity_name, account_type, raw=False):
     report.loc[~has_actuals, _ACT_SIDE_COLS] = np.nan
     report.loc[~has_budget, _BUD_SIDE_COLS] = np.nan
 
-    if raw:
-        return report
+    return report if raw else format_actuals_report(report)
 
+
+def format_actuals_report(report: pd.DataFrame) -> pd.DataFrame:
+    """Numeric actuals report → accounting-formatted strings (for downloads)."""
+    report = report.copy()
     for col in _ACT_MONEY_COLS + ["Adjusted Budget"]:
         report[col] = report[col].apply(
             lambda v: "" if pd.isna(v) else fmt_acct_currency(v)
@@ -1268,7 +1335,12 @@ def classify_function_category(func_str):
     else:
         return "Other"
 
-TAB_NAMES = ["Overview", "Exceptions", "Budget Authority", "Actuals", "Report Builder", "Trends", "Salary & Benefits"]
+# The ad-hoc report tab. One constant, so renaming it again is a one-line
+# change — everything else (URL state, the tab's own code) refers to this.
+TAB_PODHOC = "PODhoc"
+TAB_NAMES = ["Overview", TAB_PODHOC, "Exceptions", "Budget Authority", "Actuals", "Trends", "Salary & Benefits"]
+# Names a tab used to have → what it's called now, so old bookmarks keep working.
+TAB_ALIASES = {"Report Builder": TAB_PODHOC}
 
 
 # ── Sticky widgets ───────────────────────────────────────────────────────────
@@ -1370,7 +1442,7 @@ def clean_multiselect_state(key: str, options: list) -> None:
 # the sidebar, the widget keys for the Report Builder). write_url_state()
 # runs at the end of every rerun and mirrors current choices back out.
 # Short param names keep links readable:
-#   fy=2026  e=<entity>  p=Q04  s=Approved  tab=Report Builder
+#   fy=2026  e=<entity>  p=Q04  s=Approved  tab=PODhoc
 #   d=Fund,Function  m=YTD Actuals,Encumbrance  at=R  tot=1  raw=1
 #   f_Fund=<value>&f_Fund=<value>   (repeat a key for a list)
 QP_SIDEBAR = {"e": "sb_entity", "p": "sb_period", "s": "sb_status"}
@@ -1393,8 +1465,9 @@ def load_url_state() -> None:
     for param, key in QP_SIDEBAR.items():
         if qp.get(param):
             st.session_state[f"_pref_{key}"] = qp[param]
-    if qp.get("tab") in TAB_NAMES:
-        st.session_state["active_tab"] = qp["tab"]
+    tab = TAB_ALIASES.get(qp.get("tab"), qp.get("tab"))
+    if tab in TAB_NAMES:
+        st.session_state["active_tab"] = tab
 
     # Report Builder → its widget keys directly (validated against the
     # known option lists; anything unrecognized is ignored, not an error).
@@ -1433,7 +1506,7 @@ def current_url_params() -> dict:
     tab = ss.get("active_tab", TAB_NAMES[0])
     if tab != TAB_NAMES[0]:
         params["tab"] = tab
-    if tab == "Report Builder":
+    if tab == TAB_PODHOC:
         params["d"] = ",".join(ss.get("rb_dims", RB_DEFAULT_DIMS))
         params["m"] = ",".join(ss.get("rb_measures", RB_DEFAULT_MEASURES))
         if ss.get("builder_acct_type", "E") != "E":
@@ -1501,6 +1574,76 @@ def render_dim_order(dims: list) -> None:
                 st.button("▶", key=f"rb_right_{i}", on_click=_move_dim, args=(i, 1),
                           disabled=i == len(dims) - 1, help=f"Move {d} later",
                           type="tertiary", width="content")
+
+
+# ── Drill-down panel + hand-off to PODhoc ───────────────────────────────────
+def _open_in_podhoc(dim: str, value, acct_type: str, statewide: bool,
+                    src_tab: str | None = None) -> None:
+    """on_click callback: configure PODhoc to list the lines behind one
+    drill-down row, then switch tabs. Runs before the rerun, so writing
+    widget keys (rb_dims, active_tab, ...) is allowed here."""
+    ss = st.session_state
+    # Start from the source tab's own dimension filters so the line list
+    # matches the number that was clicked, then pin the clicked value.
+    for d in FILTER_DIMS:
+        ss[f"builder_{d}"] = list(ss.get(f"{src_tab}_{d}") or []) if src_tab else []
+    if dim == "Budget Entity":
+        # Entity is the global sidebar scope, not a per-tab filter — set the
+        # sticky preference and the sidebar picks it up on the rerun.
+        ss["_pref_sb_entity"] = value
+        ss["rb_dims"] = ["Fund", "Function", "Object"]
+    else:
+        ss[f"builder_{dim}"] = [value]
+        ss["rb_dims"] = (["Budget Entity"] if statewide else []) + ["Fund", "Function", "Object"]
+    if "YTD Actuals" not in ss.get("rb_measures", []):
+        ss["rb_measures"] = list(RB_DEFAULT_MEASURES)
+    ss["builder_acct_type"] = acct_type
+    ss["active_tab"] = TAB_PODHOC
+
+
+def selected_row_value(event, df: pd.DataFrame, col: str):
+    """Value of `col` in the row the user ticked in a selectable st.dataframe
+    (None if nothing is ticked). Streamlit reports the row's POSITION in the
+    DataFrame we passed in, regardless of how the user sorted the grid."""
+    rows = event.selection.rows if event is not None else []
+    if not rows or rows[0] >= len(df):
+        return None
+    return df.iloc[rows[0]][col]
+
+
+def render_drill(act_df: pd.DataFrame, bud_df: pd.DataFrame, dim: str, value,
+                 acct_type: str, key: str, statewide: bool,
+                 src_tab: str | None = None) -> None:
+    """Panel under a table: break one clicked row down by another dimension."""
+    by_options = [d for d in DRILL_DIMS
+                  if d != dim and (d != "Budget Entity" or statewide)]
+    with st.container(border=True):
+        st.markdown(f"**Drill-down** · {dim}: {value}")
+        # dim is part of the key: a different clicked dimension gets a fresh
+        # radio instead of inheriting a choice that isn't in its options.
+        by = st.radio("Break down by", options=by_options, horizontal=True,
+                      key=f"{key}_{dim}_by")
+        t = drill_breakdown(act_df, bud_df, dim, value, by)
+        if len(t) == 0:
+            st.info("No rows behind this selection.")
+            return
+        disp = t[[by, "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
+                  "Available", "Pct_Used", "Pct_of_YTD"]].rename(columns={
+            "Adjusted_Budget": "Adjusted Budget", "YTD_Actuals": "YTD Actuals",
+            "Pct_Used": "% Used (Act+Enc)", "Pct_of_YTD": "% of this YTD"})
+        st.dataframe(disp, column_config=numeric_column_config(disp),
+                     width="stretch", hide_index=True,
+                     height=min(400, len(disp) * 35 + 60))
+        top = t.iloc[0]
+        if len(t) > 1 and pd.notna(top["Pct_of_YTD"]) and top["Pct_of_YTD"] >= 50:
+            st.caption(f"{top[by]} accounts for {top['Pct_of_YTD']:.1f}% of the "
+                       f"YTD in this {dim.lower()}.")
+        st.button("Open these lines in PODhoc →", key=f"{key}_{dim}_open",
+                  on_click=_open_in_podhoc,
+                  args=(dim, value, acct_type, statewide, src_tab),
+                  help="Jumps to PODhoc with this selection applied, one row "
+                       "per account line. Click the YTD Actuals header there "
+                       "to sort largest first.")
 
 
 def main():
@@ -1831,6 +1974,43 @@ def main():
                     }), width="stretch", height=min(300, len(reimb) * 40 + 60))
                 else:
                     st.info("No reimbursable fund deficits.")
+
+        # ── By Budget Entity (statewide scope only) ──────────────────────────
+        # The statewide totals above can't say WHO is behind a number. This
+        # ranks entities by expenditure so an outlier sits on the top row.
+        if selected_entity == "— All Entities —" and (len(exp_act) > 0 or len(rev_act) > 0):
+            st.markdown('<div class="section-header">By Budget Entity</div>', unsafe_allow_html=True)
+
+            def _by_entity(df, src, out):
+                if len(df) == 0:
+                    return pd.DataFrame(columns=["Budget Entity", out])
+                return df.groupby("Budget Entity", observed=True).agg(
+                    **{out: (src, "sum")}).reset_index()
+
+            ent = _by_entity(exp_act, "Actuals YTDAmount", "Expenditure YTD")
+            for df, src, out in [
+                (exp_act, "Actuals Encumbrance", "Encumbrance"),
+                (exp_bud, "Adjusted Amt", "Expenditure Budget"),
+                (rev_act, "Actuals YTDAmount", "Revenue YTD"),
+            ]:
+                ent = ent.merge(_by_entity(df, src, out), on="Budget Entity", how="outer")
+            ent = fillna_numeric(ent)
+            ent["% Spent"] = (ent["Expenditure YTD"]
+                              / ent["Expenditure Budget"].replace(0, np.nan) * 100)
+            ent = ent[["Budget Entity", "Expenditure Budget", "Expenditure YTD",
+                       "Encumbrance", "% Spent", "Revenue YTD"]].sort_values(
+                "Expenditure YTD", ascending=False).reset_index(drop=True)
+
+            ent_event = st.dataframe(
+                ent, column_config=numeric_column_config(ent),
+                width="stretch", height=min(320, len(ent) * 35 + 60), hide_index=True,
+                on_select="rerun", selection_mode="single-row", key="ov_entity_tbl")
+            st.caption("Sorted by Expenditure YTD, largest first — click any header "
+                       "to re-sort. Tick a row to drill into that entity's expenditures.")
+            ent_pick = selected_row_value(ent_event, ent, "Budget Entity")
+            if ent_pick is not None:
+                render_drill(exp_act, exp_bud, "Budget Entity", ent_pick, "E",
+                             key="ov_entity_drill", statewide=True)
 
         # ── Budget Execution Gauges ──────────────────────────────────────────
         st.markdown('<div class="section-header">Budget Execution</div>', unsafe_allow_html=True)
@@ -2333,11 +2513,15 @@ def main():
 
         if selected_entity != "— All Entities —":
             bud_raw_vals = st.toggle(
-                "Raw numeric values", key="bud_export_raw",
-                help="On: unformatted numbers for pivoting/analysis. Off: accounting format ($1,234.56 / parentheses for negatives)."
+                "Raw numeric values in downloads", key="bud_export_raw",
+                help="Applies to the downloads. On: unformatted numbers for pivoting/analysis. Off: accounting format ($1,234.56 / parentheses for negatives). The previews always sort by value."
             )
-            exp_budget_report = build_budget_report(bud_raw, selected_entity, "E", raw=bud_raw_vals)
-            rev_budget_report = build_budget_report(bud_raw, selected_entity, "R", raw=bud_raw_vals)
+            # Numeric frames for the on-screen previews (sortable); the
+            # *_export frames are what the download buttons send.
+            exp_budget_report = build_budget_report(bud_raw, selected_entity, "E", raw=True)
+            rev_budget_report = build_budget_report(bud_raw, selected_entity, "R", raw=True)
+            exp_budget_export = exp_budget_report if bud_raw_vals else format_budget_report(exp_budget_report)
+            rev_budget_export = rev_budget_report if bud_raw_vals else format_budget_report(rev_budget_report)
 
             entity_short = selected_entity.replace(" ", "_").replace("/", "-")
             fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
@@ -2346,19 +2530,20 @@ def main():
             with bc1:
                 st.markdown(f"**Expenditure Budget** — {len(exp_budget_report):,} lines")
                 if len(exp_budget_report) > 0:
-                    st.dataframe(exp_budget_report, width="stretch", height=300)
+                    st.dataframe(exp_budget_report, column_config=numeric_column_config(exp_budget_report),
+                                 width="stretch", height=300)
                     e1, e2 = st.columns(2)
                     with e1:
                         st.download_button(
                             "Exp Budget CSV",
-                            data=exp_budget_report.to_csv(index=False),
+                            data=exp_budget_export.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_exp_budget.csv",
                             mime="text/csv", key="dl_bud_exp_csv"
                         )
                     with e2:
                         st.download_button(
                             "Exp Budget Excel",
-                            data=to_excel_download(exp_budget_report, "Exp Budget"),
+                            data=to_excel_download(exp_budget_export, "Exp Budget"),
                             file_name=f"{entity_short}_fy{fy_code}_exp_budget.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="dl_bud_exp_xlsx"
@@ -2367,19 +2552,20 @@ def main():
             with bc2:
                 st.markdown(f"**Revenue Budget** — {len(rev_budget_report):,} lines")
                 if len(rev_budget_report) > 0:
-                    st.dataframe(rev_budget_report, width="stretch", height=300)
+                    st.dataframe(rev_budget_report, column_config=numeric_column_config(rev_budget_report),
+                                 width="stretch", height=300)
                     r1, r2 = st.columns(2)
                     with r1:
                         st.download_button(
                             "Rev Budget CSV",
-                            data=rev_budget_report.to_csv(index=False),
+                            data=rev_budget_export.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_rev_budget.csv",
                             mime="text/csv", key="dl_bud_rev_csv"
                         )
                     with r2:
                         st.download_button(
                             "Rev Budget Excel",
-                            data=to_excel_download(rev_budget_report, "Rev Budget"),
+                            data=to_excel_download(rev_budget_export, "Rev Budget"),
                             file_name=f"{entity_short}_fy{fy_code}_rev_budget.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="dl_bud_rev_xlsx"
@@ -2421,8 +2607,15 @@ def main():
         st.markdown("#### Spend Distribution")
 
         if len(act_act_f) > 0:
+            act_statewide = selected_entity == "— All Entities —"
+            spend_options = ["Fund", "Function", "Object"] + (
+                ["Budget Entity"] if act_statewide else [])
+            # "Budget Entity" only exists statewide; forget it if an entity
+            # was picked since, or the radio would hold a value it can't show.
+            if st.session_state.get("act_spend_group") not in spend_options:
+                st.session_state.pop("act_spend_group", None)
             spend_group = st.radio(
-                "View by", options=["Fund", "Function", "Object"],
+                "View by", options=spend_options,
                 index=0, horizontal=True, key="act_spend_group"
             )
 
@@ -2450,11 +2643,24 @@ def main():
                 st.plotly_chart(fig_d, width="stretch")
 
             with sc2:
-                sd = spend_data[[spend_group, "YTD", "Enc", "Pct"]].head(15).copy()
+                # All rows now (it scrolls), not just the top 15 — with
+                # Budget Entity in play the outlier has to be findable.
+                sd = spend_data[[spend_group, "YTD", "Enc", "Pct"]].reset_index(drop=True)
                 sd.columns = [spend_group, "YTD Actuals", "Encumbrance", "% of Total"]
-                st.dataframe(sd.style.format({
+                # on_select="rerun" turns the grid into an input: ticking a
+                # row reruns the script and the event says which row.
+                spend_event = st.dataframe(sd.style.format({
                     "YTD Actuals": "${:,.0f}", "Encumbrance": "${:,.0f}", "% of Total": "{:.1f}%"
-                }), width="stretch", height=min(400, len(sd) * 35 + 60))
+                }), width="stretch", height=min(400, len(sd) * 35 + 60),
+                    on_select="rerun", selection_mode="single-row",
+                    key=f"act_spend_tbl_{spend_group}")
+                st.caption("Tick a row to drill into it.")
+
+            spend_pick = selected_row_value(spend_event, sd, spend_group)
+            if spend_pick is not None:
+                render_drill(act_act_f, act_bud_f, spend_group, spend_pick,
+                             act_acct_type, key="act_spend_drill",
+                             statewide=act_statewide, src_tab="actuals")
 
         # ── Budget vs Actuals by Function ────────────────────────────────────
         st.markdown("---")
@@ -2487,12 +2693,13 @@ def main():
             )
             st.plotly_chart(fig_fb, width="stretch")
 
-            st.dataframe(
-                func_m[["Function", "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
-                        "Available", "Pct_Used"]].rename(columns={
-                    "Adjusted_Budget": "Adjusted Budget", "YTD_Actuals": "YTD Actuals",
-                    "Pct_Used": "% Used (Act+Enc)"
-                }).style.format({
+            func_tbl = func_m[["Function", "Adjusted_Budget", "YTD_Actuals", "Encumbrance",
+                               "Available", "Pct_Used"]].rename(columns={
+                "Adjusted_Budget": "Adjusted Budget", "YTD_Actuals": "YTD Actuals",
+                "Pct_Used": "% Used (Act+Enc)"
+            }).reset_index(drop=True)
+            func_event = st.dataframe(
+                func_tbl.style.format({
                     "Adjusted Budget": "${:,.0f}", "YTD Actuals": "${:,.0f}",
                     "Encumbrance": "${:,.0f}", "Available": "${:,.0f}",
                     "% Used (Act+Enc)": "{:.1f}%"
@@ -2500,8 +2707,16 @@ def main():
                     lambda v: "color: #c64c43; font-weight: 600" if isinstance(v, (int, float)) and v < 0 else "",
                     subset=["Available"]
                 ),
-                width="stretch", height=min(500, len(func_m) * 35 + 60)
+                width="stretch", height=min(500, len(func_m) * 35 + 60),
+                on_select="rerun", selection_mode="single-row", key="act_func_tbl"
             )
+            st.caption("Tick a row to drill into it.")
+            func_pick = selected_row_value(func_event, func_tbl, "Function")
+            if func_pick is not None:
+                render_drill(act_act_f, act_bud_f, "Function", func_pick,
+                             act_acct_type, key="act_func_drill",
+                             statewide=selected_entity == "— All Entities —",
+                             src_tab="actuals")
 
         # ── CSV Exports ──────────────────────────────────────────────────────
         st.markdown("---")
@@ -2509,34 +2724,37 @@ def main():
 
         if selected_entity != "— All Entities —":
             act_raw_vals = st.toggle(
-                "Raw numeric values", key="act_export_raw",
-                help="On: unformatted numbers for pivoting/analysis. Off: accounting format ($1,234.56 / parentheses for negatives)."
+                "Raw numeric values in downloads", key="act_export_raw",
+                help="Applies to the downloads. On: unformatted numbers for pivoting/analysis. Off: accounting format ($1,234.56 / parentheses for negatives). The previews always sort by value."
             )
 
             entity_short = selected_entity.replace(" ", "_").replace("/", "-")
             fy_code = fy_key_to_code(selected_fy[0]) if selected_fy else "xxxx"
             period_code = selected_period.lower() if selected_period else "all"
 
-            exp_act_report = build_actuals_report(act_global, bud_global, selected_entity, "E", raw=act_raw_vals)
-            rev_act_report = build_actuals_report(act_global, bud_global, selected_entity, "R", raw=act_raw_vals)
+            exp_act_report = build_actuals_report(act_global, bud_global, selected_entity, "E", raw=True)
+            rev_act_report = build_actuals_report(act_global, bud_global, selected_entity, "R", raw=True)
+            exp_act_export = exp_act_report if act_raw_vals else format_actuals_report(exp_act_report)
+            rev_act_export = rev_act_report if act_raw_vals else format_actuals_report(rev_act_report)
 
             ac1, ac2 = st.columns(2)
             with ac1:
                 st.markdown(f"**Expenditure Actuals** — {len(exp_act_report):,} lines")
                 if len(exp_act_report) > 0:
-                    st.dataframe(exp_act_report, width="stretch", height=300)
+                    st.dataframe(exp_act_report, column_config=numeric_column_config(exp_act_report),
+                                 width="stretch", height=300)
                     ae1, ae2 = st.columns(2)
                     with ae1:
                         st.download_button(
                             "Exp Actuals CSV",
-                            data=exp_act_report.to_csv(index=False),
+                            data=exp_act_export.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_exp.csv",
                             mime="text/csv", key="dl_act_exp_csv"
                         )
                     with ae2:
                         st.download_button(
                             "Exp Actuals Excel",
-                            data=to_excel_download(exp_act_report, "Expenditures"),
+                            data=to_excel_download(exp_act_export, "Expenditures"),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_exp.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="dl_act_exp_xlsx"
@@ -2545,19 +2763,20 @@ def main():
             with ac2:
                 st.markdown(f"**Revenue Actuals** — {len(rev_act_report):,} lines")
                 if len(rev_act_report) > 0:
-                    st.dataframe(rev_act_report, width="stretch", height=300)
+                    st.dataframe(rev_act_report, column_config=numeric_column_config(rev_act_report),
+                                 width="stretch", height=300)
                     ar1, ar2 = st.columns(2)
                     with ar1:
                         st.download_button(
                             "Rev Actuals CSV",
-                            data=rev_act_report.to_csv(index=False),
+                            data=rev_act_export.to_csv(index=False),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_rev.csv",
                             mime="text/csv", key="dl_act_rev_csv"
                         )
                     with ar2:
                         st.download_button(
                             "Rev Actuals Excel",
-                            data=to_excel_download(rev_act_report, "Revenue"),
+                            data=to_excel_download(rev_act_export, "Revenue"),
                             file_name=f"{entity_short}_fy{fy_code}_{period_code}_rev.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="dl_act_rev_xlsx"
@@ -2567,11 +2786,11 @@ def main():
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 5: REPORT BUILDER
+    # TAB 2 (in the nav): PODHOC — custom report builder
     # ══════════════════════════════════════════════════════════════════════════════
-    elif st.session_state.active_tab == "Report Builder":
+    elif st.session_state.active_tab == TAB_PODHOC:
 
-        st.markdown('<div class="section-header">Custom Report Builder</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">PODhoc · Custom Report Builder</div>', unsafe_allow_html=True)
         st.caption(
             "Compose a report from any combination of row dimensions and measures, "
             "scoped by the sidebar (entity · fiscal year · period) and the filters "
@@ -2621,18 +2840,24 @@ def main():
             include_totals = st.checkbox("Totals row", key="rb_totals")
         with oc2:
             rb_raw_vals = st.toggle(
-                "Raw numeric values", key="rb_raw_vals",
-                help="On: unformatted numbers for pivoting/analysis. "
-                     "Off: accounting format.")
+                "Raw numeric values in downloads", key="rb_raw_vals",
+                help="Applies to the CSV/Excel downloads. On: unformatted "
+                     "numbers for pivoting/analysis. Off: accounting format "
+                     "($1,234.56 / parentheses for negatives). The table on "
+                     "screen always sorts by value either way.")
 
         if not row_dims:
             st.info("Pick at least one row dimension to build the report.")
         elif not measures:
             st.info("Pick at least one measure.")
         else:
+            # One numeric frame feeds both outputs: the screen shows it as
+            # numbers (so header clicks sort by value); downloads get the
+            # accounting strings unless "raw" is on.
             report = build_custom_report(
                 rb_act_f, rb_bud_f, row_dims, measures,
-                raw=rb_raw_vals, totals=include_totals)
+                raw=True, totals=include_totals)
+            report_export = report if rb_raw_vals else format_custom_report(report)
 
             # Never let missing actuals pass as blank cells. Only matters
             # when an actuals measure (or a derived one) is on screen.
@@ -2652,7 +2877,9 @@ def main():
                        if funnel and funnel[-1][1] > 0 else ""))
 
             st.markdown(f"**{len(report):,} rows** · {entity_label} · {fy_label} · {period_label}")
-            st.dataframe(report, width="stretch", height=500)
+            st.caption("Click a column header to sort — money columns sort by amount.")
+            st.dataframe(report, column_config=numeric_column_config(report),
+                         width="stretch", height=500)
 
             entity_short = (selected_entity.replace(" ", "_").replace("/", "-")
                             if selected_entity != "— All Entities —" else "statewide")
@@ -2664,13 +2891,13 @@ def main():
             with d1:
                 st.download_button(
                     "Custom Report CSV",
-                    data=report.to_csv(index=False),
+                    data=report_export.to_csv(index=False),
                     file_name=f"{base_name}.csv",
                     mime="text/csv", key="rb_dl_csv")
             with d2:
                 st.download_button(
                     "Custom Report Excel",
-                    data=to_excel_download(report, "Custom Report"),
+                    data=to_excel_download(report_export, "Custom Report"),
                     file_name=f"{base_name}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="rb_dl_xlsx")
